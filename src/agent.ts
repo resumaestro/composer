@@ -1,93 +1,124 @@
-import type { Env } from "./index";
-import { queryVectorDatabase, type QueryVectorResult } from "./skills/queryVectorDatabase";
-import { researchCompany, type CompanyResearch } from "./skills/researchCompany";
-import { buildResume, type BuildResumeResult } from "./skills/buildResume";
-
-export type WorkType = "remote" | "hybrid" | "onsite";
-
-export interface PipelineInput {
-  jobId: string;
-  company: string;
-  query: string;
-  jobDescription?: string;
-  address?: string;
-  workType?: WorkType;
-  topK?: number;
-  callbackUrl?: string;
-}
-
-export interface PipelineResult {
-  jobId: string;
-  company: string;
-  status: "ready_for_review" | "rejected";
-  /** This pipeline never auto-submits: every result stops at a human review gate. */
-  humanGate: true;
-  evidence: QueryVectorResult;
-  research: CompanyResearch;
-  resume: BuildResumeResult | null;
-  notes: string[];
-  completedAt: string;
-}
-
 /**
- * Execution orchestrator. Runs the migrated skills in sequence:
+ * src/agent.ts
  *
- *   1. queryVectorDatabase  (from job-vector)   -> supporting evidence from Vectorize
- *   2. researchCompany      (from job-research) -> company brief + hard-criteria screen + fit score
- *   3. buildResume          (from job-resume)   -> tailored one-page Markdown resume
+ * Core coordinator. Runs the full migrated pipeline for one job:
  *
- * The orchestrator respects the candidate's hard criteria (it stops before building a resume for
- * an auto-rejected role) and never submits an application. It returns a result for human review.
+ *   cache check (done by the router) -> research (browser, on miss)
+ *     -> semantic evidence (Vectorize) -> resume build (tiered model)
+ *     -> result callback.
+ *
+ * This function is invoked from inside ctx.waitUntil() by the router, so it
+ * owns its own error handling: every terminal path (success or failure) ends
+ * by posting a JobResult to the callback seam. It must not throw back into the
+ * waitUntil scheduler.
  */
-export async function runPipeline(env: Env, input: PipelineInput): Promise<PipelineResult> {
-  const notes: string[] = [];
 
-  // 1. Supporting evidence from the vector index.
-  const evidence = await queryVectorDatabase(env, input.query, input.topK ?? 6);
-  notes.push(`Vector query returned ${evidence.matches.length} match(es).`);
+import type { ActionRequest, CompanyResearch, Env, JobResult } from "./types.js";
+import type { CacheReadResult } from "./lib/cache.js";
+import { writeResearchCache } from "./lib/cache.js";
+import { postResult } from "./lib/callback.js";
+import { researchCompany } from "./skills/researchCompany.js";
+import { queryVectorDatabase, evidenceToContext } from "./skills/queryVectorDatabase.js";
+import { buildResume } from "./skills/buildResume.js";
+import { clamp } from "./lib/text.js";
 
-  // 2. Company research + hard-criteria screen.
-  const research = await researchCompany(env, input.company, {
-    address: input.address,
-    workType: input.workType,
-    jobText: input.jobDescription ?? input.query,
-  });
-  notes.push(`Research fit score: ${research.fitScore}/10.`);
+/** Chooses the URL to scrape, preferring an explicit company page. */
+function scrapeTarget(req: ActionRequest): string | undefined {
+  return req.companyUrl || req.jobPostingUrl || undefined;
+}
 
-  // Respect the hard criteria: if the role is auto-rejected, stop before building the resume.
-  if (research.rejected) {
-    notes.push(`Auto-rejected: ${research.rejectionReason ?? "did not meet hard criteria"}.`);
-    return {
-      jobId: input.jobId,
-      company: input.company,
-      status: "rejected",
-      humanGate: true,
-      evidence,
-      research,
-      resume: null,
-      notes,
-      completedAt: new Date().toISOString(),
-    };
+/** Assembles the query that drives the Vectorize evidence lookup. */
+function evidenceQuery(req: ActionRequest, research: CompanyResearch): string {
+  const role = req.role || "";
+  const postingSignal = req.jobPostingText || research.summary || "";
+  return `${role}. ${clamp(postingSignal, 600)}`;
+}
+
+/** The job posting text the resume builder should tailor against. */
+function postingText(req: ActionRequest, research: CompanyResearch): string {
+  if (req.jobPostingText && req.jobPostingText.trim().length > 0) {
+    return req.jobPostingText;
   }
+  // Fall back to scraped posting/company text when no inline posting was given.
+  return research.page?.bodyText || research.summary || "";
+}
 
-  // 3. Synthesize the tailored resume from evidence + research context.
-  const resume = await buildResume(env, {
-    company: input.company,
-    jobDescription: input.jobDescription ?? input.query,
-    vectorContext: evidence.context,
-    companyContext: research.summary,
-  });
-  notes.push(`Resume synthesized with ${resume.model}.`);
+export async function runOrchestration(
+  env: Env,
+  req: ActionRequest,
+  jobId: string,
+  cache: CacheReadResult,
+): Promise<void> {
+  const company = req.company;
+  const role = req.role || "Unspecified Role";
 
-  return {
-    jobId: input.jobId,
-    company: input.company,
-    status: "ready_for_review",
-    humanGate: true,
-    evidence,
-    research,
-    resume,
-    notes,
-    completedAt: new Date().toISOString(),
-  };
+  try {
+    // --- 1. Research: use fresh cache, otherwise scrape (Step 2 / Step 3) ---
+    let research: CompanyResearch;
+    if (cache.hit && cache.research) {
+      research = cache.research;
+    } else {
+      const target = scrapeTarget(req);
+      if (target) {
+        research = await researchCompany(env, company, target);
+        // Persist for the next run's 7-day window.
+        await writeResearchCache(env, company, research);
+      } else {
+        // No URL to scrape and no cache: proceed with whatever text the caller gave.
+        research = {
+          company,
+          source: "browser",
+          summary: `Company: ${company}. No research URL supplied; using caller-provided posting text only.`,
+        };
+      }
+    }
+
+    // --- 2. Semantic evidence from Vectorize (Step 4, topK capped at 3) -----
+    const evidence = await queryVectorDatabase(
+      env,
+      evidenceQuery(req, research),
+      req.options?.topK,
+    );
+
+    // --- 3. Build the tailored resume (Step 5, tiered model routing) --------
+    const resume = await buildResume(
+      env,
+      {
+        role,
+        company,
+        jobPosting: postingText(req, research),
+        sourceProfile: req.sourceProfile || "",
+        research: research.summary,
+        supportingEvidence: evidenceToContext(evidence),
+      },
+      req.options?.tier,
+    );
+
+    // --- 4. Deliver success to the callback seam ---------------------------
+    const result: JobResult = {
+      jobId,
+      status: "completed",
+      company,
+      role,
+      cacheHit: cache.hit,
+      research,
+      evidence,
+      resume,
+      finishedAt: new Date().toISOString(),
+    };
+    await postResult(env, result);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[orchestration] job ${jobId} failed:`, message);
+    const failure: JobResult = {
+      jobId,
+      status: "failed",
+      company,
+      role,
+      cacheHit: cache.hit,
+      error: message,
+      finishedAt: new Date().toISOString(),
+    };
+    await postResult(env, failure);
+  }
 }
