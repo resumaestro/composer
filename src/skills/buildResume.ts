@@ -1,93 +1,144 @@
-import type { Env } from "../index";
-import { AGENT_PERSONA, RESUME_SYSTEM_PROMPT } from "../../config/prompts";
+/**
+ * src/skills/buildResume.ts
+ *
+ * Migrates the legacy `job-resume` skill's drafting step with a tiered,
+ * config-driven model architecture (Step 5):
+ *
+ *  - edge tier (default): Workers AI (`env.AI.run`). Zero egress, cheap,
+ *    good enough for base structure and stitching.
+ *  - premium tier: an external provider (Anthropic by default) reached ONLY
+ *    through a Cloudflare AI Gateway URL, so identical prompts are cached by
+ *    the gateway and not re-billed.
+ *
+ * The target model for each tier lives in config/agentConfig.json so routing
+ * can be retuned without code changes. Token budgets are set generously there
+ * to avoid truncating a full one-page resume, while the system prompt enforces
+ * the "data only, no filler" guardrail.
+ *
+ * If premium is selected but the gateway/key is not configured, the build
+ * degrades gracefully to the edge tier rather than failing the job.
+ */
 
-export interface BuildResumeInput {
-  company: string;
-  jobDescription: string;
-  vectorContext: string;
-  companyContext: string;
-  /** Optional override for the candidate profile; defaults to source.yml from R2. */
-  sourceProfile?: string;
+import config from "../../config/agentConfig.json";
+import {
+  RESUME_SYSTEM_PROMPT,
+  buildResumeUserPrompt,
+  type ResumePromptInput,
+} from "../../config/prompts.js";
+import type { Env, ModelTier, ResumeResult } from "../types.js";
+
+type AiRun = (model: string, inputs: Record<string, unknown>) => Promise<unknown>;
+
+interface EdgeChatResponse {
+  response?: string;
 }
 
-export interface BuildResumeResult {
-  markdown: string;
-  model: string;
-  usedSourceOfTruth: boolean;
+interface AnthropicTextBlock {
+  type: string;
+  text?: string;
+}
+interface AnthropicResponse {
+  content?: AnthropicTextBlock[];
 }
 
-const DEFAULT_RESUME_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
-const SOURCE_KEY = "source.yml";
-const BASE_RESUME_KEY = "BASE_RESUME.html";
+/** Workers AI chat completion (edge tier). */
+async function runEdge(env: Env, system: string, user: string): Promise<string> {
+  const { model, maxTokens, temperature } = config.modelRouting.edge;
+  const run = env.AI.run as unknown as AiRun;
+  const result = (await run(model, {
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ],
+    max_tokens: maxTokens,
+    temperature,
+  })) as EdgeChatResponse;
 
-interface ChatResponse {
-  response: string;
+  const text = (result?.response || "").trim();
+  if (!text) throw new Error(`Edge model ${model} returned empty output`);
+  return text;
 }
 
 /**
- * Migrated from the legacy `job-resume` skill.
- *
- * Loads the authoritative candidate profile (source.yml) from R2, combines it with the vector
- * evidence and company research context, and uses Workers AI (`env.AI.run`) to synthesize a
- * tailored, one-page Markdown resume. source.yml is the only source of truth; the model is
- * instructed never to fabricate beyond it. The legacy skill rendered HTML + PDF through the
- * job-slack gateway; this version returns Markdown for the caller to render or convert downstream.
+ * Premium tier through the Cloudflare AI Gateway. The provider endpoint is
+ * appended to AI_GATEWAY_URL so the request is always proxied (and cached) by
+ * the gateway — never sent direct to the provider.
  */
-export async function buildResume(env: Env, input: BuildResumeInput): Promise<BuildResumeResult> {
-  // 1. Load the source of truth (and the optional base template) from R2.
-  const sourceProfile = input.sourceProfile ?? (await readR2Text(env, SOURCE_KEY));
-  if (!sourceProfile) {
-    throw new Error(
-      `buildResume: '${SOURCE_KEY}' not found in the R2 bucket. Cannot build a resume without the source of truth.`,
-    );
+async function runPremium(env: Env, system: string, user: string): Promise<string> {
+  const gateway = (env.AI_GATEWAY_URL || "").replace(/\/+$/, "");
+  if (!gateway || !env.PREMIUM_API_KEY) {
+    throw new Error("premium tier requires AI_GATEWAY_URL and PREMIUM_API_KEY");
   }
-  const baseResume = await readR2Text(env, BASE_RESUME_KEY);
 
-  // 2. Assemble the prompt.
-  const model = env.RESUME_MODEL || DEFAULT_RESUME_MODEL;
-  const userPrompt = [
-    `Target company: ${input.company}`,
-    "",
-    "Job posting / requirements:",
-    input.jobDescription || "(none provided)",
-    "",
-    "Candidate profile (source.yml — authoritative, do not invent beyond this):",
-    sourceProfile,
-    "",
-    "Supporting technical evidence (context only, never fabricate claims from this):",
-    input.vectorContext || "(none)",
-    "",
-    "Company research context (for framing only):",
-    input.companyContext || "(none)",
-    baseResume
-      ? "\nA base resume template exists in storage; preserve its section ordering and hierarchy where possible."
-      : "",
-    "",
-    "Write the tailored one-page resume in Markdown now.",
-  ].join("\n");
+  const cfg = config.modelRouting.premium;
+  const endpoint = `${gateway}/anthropic/v1/messages`;
 
-  // 3. Synthesize with Workers AI.
-  const run = env.AI.run as unknown as (
-    m: string,
-    inputs: Record<string, unknown>,
-  ) => Promise<ChatResponse>;
-  const result = await run(model, {
-    messages: [
-      { role: "system", content: `${AGENT_PERSONA}\n\n${RESUME_SYSTEM_PROMPT}` },
-      { role: "user", content: userPrompt },
-    ],
-    max_tokens: 2048,
-    temperature: 0.2,
+  const res = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-api-key": env.PREMIUM_API_KEY,
+      "anthropic-version": cfg.anthropicVersion,
+    },
+    body: JSON.stringify({
+      model: cfg.model,
+      max_tokens: cfg.maxTokens,
+      temperature: cfg.temperature,
+      system,
+      messages: [{ role: "user", content: user }],
+    }),
   });
 
-  const markdown = (result?.response ?? "").trim();
-  if (!markdown) throw new Error("buildResume: model returned an empty resume.");
+  if (!res.ok) {
+    const detail = await res.text().catch(() => "");
+    throw new Error(`premium provider responded ${res.status}: ${detail.slice(0, 300)}`);
+  }
 
-  return { markdown, model, usedSourceOfTruth: true };
+  const data = (await res.json()) as AnthropicResponse;
+  const text = (data.content || [])
+    .filter((b) => b.type === "text" && b.text)
+    .map((b) => b.text as string)
+    .join("")
+    .trim();
+
+  if (!text) throw new Error("premium provider returned no text content");
+  return text;
 }
 
-async function readR2Text(env: Env, key: string): Promise<string | null> {
-  const object = await env.JOB_SOURCE.get(key);
-  if (!object) return null;
-  return object.text();
+/**
+ * Builds the tailored resume. Resolves the tier (request override > config),
+ * runs the matching provider, and returns the markdown plus routing metadata.
+ */
+export async function buildResume(
+  env: Env,
+  input: ResumePromptInput,
+  tierOverride?: ModelTier,
+): Promise<ResumeResult> {
+  const requestedTier: ModelTier =
+    tierOverride || (config.modelRouting.tier as ModelTier);
+
+  const system = RESUME_SYSTEM_PROMPT;
+  const user = buildResumeUserPrompt(input);
+
+  let tier: ModelTier = requestedTier;
+  let markdown: string;
+  let model: string;
+
+  if (requestedTier === "premium") {
+    try {
+      markdown = await runPremium(env, system, user);
+      model = config.modelRouting.premium.model;
+    } catch (err) {
+      // Graceful degradation: premium misconfigured or upstream failed.
+      console.warn(`[buildResume] premium tier unavailable, falling back to edge:`, err);
+      tier = "edge";
+      markdown = await runEdge(env, system, user);
+      model = config.modelRouting.edge.model;
+    }
+  } else {
+    markdown = await runEdge(env, system, user);
+    model = config.modelRouting.edge.model;
+  }
+
+  return { role: input.role, company: input.company, tier, model, markdown };
 }

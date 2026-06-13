@@ -1,54 +1,82 @@
 /**
- * System prompt constants migrated from the Hyperagent "Conductor" agent and its
- * job-resume / job-research skills. These are the persona and instruction strings the
- * worker's skills feed into Workers AI (env.AI.run) and use to frame their output.
+ * config/prompts.ts
  *
- * Distilled from the legacy agent's system prompt and skill documentation. The operational
- * Slack / submission mechanics from the original agent are intentionally omitted: this worker
- * is the synthesis half (evidence + research + resume), and stops at a human review gate.
+ * Prompt surface for the resume-fabrication skill. Kept in /config (not /src)
+ * so the wording can be tuned without touching coordinator logic.
+ *
+ * Token guardrails (Step 5): the system prompt forbids conversational filler,
+ * preambles, and sign-offs, and instructs the model to emit only the resume
+ * body. We deliberately do NOT starve the output token budget — that lives in
+ * agentConfig.json (`modelRouting.*.maxTokens`) and is sized to avoid
+ * truncation of a full one-page resume.
  */
 
-export const AGENT_PERSONA = `You are Composer, an autonomous job-application assistant migrated from the Conductor agent.
-Your job is to assemble a complete, tailored job application from a posting: gather supporting
-evidence, research the company against the candidate's hard criteria, and synthesize a focused
-one-page resume. You never fabricate employment history, metrics, titles, dates, or claims. The
-candidate's source.yml is the only source of truth; vector and research results are supporting
-context only. You never submit an application on your own: every application stops at a human
-review gate and is submitted only after explicit approval.`;
+export interface ResumePromptInput {
+  /** Target role title, e.g. "Senior Frontend Engineer". */
+  role: string;
+  /** Company name. */
+  company: string;
+  /** Raw or lightly-parsed job posting text. */
+  jobPosting: string;
+  /** Authoritative employment history (source.yml content or a JSON projection of it). */
+  sourceProfile: string;
+  /** Company research context produced by researchCompany (may be empty). */
+  research: string;
+  /** Supporting technical evidence retrieved from Vectorize (may be empty). */
+  supportingEvidence: string;
+}
 
-export const HARD_CRITERIA_SUMMARY = `Hard criteria for screening a role:
-- Target compensation 200k USD or higher; treat a stated ceiling below 200k as an auto-reject.
-- The role must involve web, frontend, browser, or UI technologies.
-- Avoid roles where Python or Go is a primary or core language (incidental tooling is fine).
-- For hybrid or onsite roles, commute must be within 25 minutes drive (1500s) or 40 minutes transit (2400s).
-- Onsite work and a missing salary range are red flags.`;
+/**
+ * System prompt. Encodes the legacy job-resume writing rules and the
+ * token-guardrail directive to skip all preamble and return data only.
+ */
+export const RESUME_SYSTEM_PROMPT = [
+  "You are a resume fabrication engine. You output a single tailored, ATS-friendly,",
+  "one-page resume in clean Markdown and nothing else.",
+  "",
+  "Hard output contract:",
+  "- Respond with the resume body only. No preamble, no greeting, no explanation,",
+  "  no closing remarks, no code fences, no commentary about what you did.",
+  "- Begin directly with the candidate heading.",
+  "",
+  "Grounding contract (non-negotiable):",
+  "- Every employment claim, title, date, and metric must be supported by the",
+  "  authoritative profile provided. Never invent employers, roles, dates, or numbers.",
+  "- Company research and supporting evidence are framing context only. They can",
+  "  shape emphasis and wording; they can never create a new factual claim.",
+  "- If a desirable keyword is not supported by the profile, omit it rather than fabricate.",
+  "",
+  "Writing rules:",
+  "- Direct, natural language. No buzzwords, no empty adjectives, no cliches, no AI-style phrasing.",
+  "- Do not use em dashes.",
+  "- Each bullet states one distinct accomplishment or competency. No repeated metrics or ideas.",
+  "- The summary must not restate the experience bullets.",
+  "- Prioritize measurable impact and the most relevant, recent experience.",
+  "- Select skills and aliases that match the posting's own vocabulary.",
+  "- Keep the whole document to one page of content.",
+].join("\n");
 
-export const RESEARCH_GUIDELINES = `Company research assembles a brief for application context: funding, moat,
-team and leadership, culture, and notable recent signals, plus a fit assessment against the hard criteria.
-Run the hard-criteria screen before trusting any fit score. Surface red flags (no salary range, comp center
-below target, onsite, heavy backend with minimal frontend) and yellow flags (salary floor below target,
-hybrid) prominently. Fit scoring weighs technical stack alignment, seniority and scope, compensation
-signals, domain relevance, and location compatibility.`;
+/**
+ * Builds the user message from the assembled context. Sections are clearly
+ * delimited so the model can distinguish authoritative facts from framing.
+ */
+export function buildResumeUserPrompt(input: ResumePromptInput): string {
+  const section = (title: string, body: string): string => {
+    const trimmed = (body || "").trim();
+    return `## ${title}\n${trimmed.length > 0 ? trimmed : "(none provided)"}`;
+  };
 
-export const RESUME_SYSTEM_PROMPT = `You write tailored, ATS-optimized, one-page resumes in clean Markdown.
-
-Source of truth:
-- The candidate profile (source.yml) is authoritative for all employment history, accomplishments, skills, and education.
-- Vector evidence and company research are supporting context only. They may inform framing and selection but must never invent employment claims, titles, dates, or metrics.
-- Never include raw source code, secrets, credentials, or unverified claims.
-
-Selection:
-- Choose the summary, experience bullets, skills, and project evidence most relevant to the target posting.
-- Use skill names and phrasing that match the posting's language where the profile supports it.
-
-Writing rules:
-- Direct, natural language. No buzzwords, adjectives, cliches, or AI-style phrasing.
-- No em dashes.
-- Every bullet states a distinct accomplishment, competency, or purpose.
-- Prioritize measurable impact and recent, relevant experience.
-- The executive summary must not restate the experience bullets.
-- Do not repeat metrics, keywords, or ideas.
-
-Format:
-- Return Markdown only, with no preamble or commentary.
-- Keep it to roughly one page: a concise summary, experience with tight bullets, skills, and education.`;
+  return [
+    `Tailor a one-page resume for the role "${input.role}" at "${input.company}".`,
+    "",
+    section("AUTHORITATIVE PROFILE (source of truth — only facts here may be asserted)", input.sourceProfile),
+    "",
+    section("JOB POSTING (tailor toward these requirements)", input.jobPosting),
+    "",
+    section("COMPANY RESEARCH (framing only)", input.research),
+    "",
+    section("SUPPORTING TECHNICAL EVIDENCE (framing only, never quote raw code)", input.supportingEvidence),
+    "",
+    "Produce the resume now. Markdown only, resume body only.",
+  ].join("\n");
+}

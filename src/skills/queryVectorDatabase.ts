@@ -1,102 +1,116 @@
-import type { Env } from "../index";
+/**
+ * src/skills/queryVectorDatabase.ts
+ *
+ * Migrates the legacy `job-vector` skill's read path. Embeds a query with
+ * Workers AI (1024-dim qwen embedding in the legacy stack) and runs it against
+ * env.VECTOR_INDEX.
+ *
+ * Cost cap (Step 4): topK is hard-capped at MAX_TOP_K (3). No caller can exceed
+ * it — the request is clamped, not trusted.
+ *
+ * RAG safety (carried over from job-resume): never surface raw code, secrets,
+ * or credentials. Metadata keys on the block list are dropped, and records
+ * flagged `verified: false` are returned with `verified: false` so downstream
+ * prompts phrase them conservatively.
+ */
 
-export interface VectorMatch {
-  id: string;
-  score: number;
-  metadata: Record<string, unknown> | null;
-}
+import config from "../../config/agentConfig.json";
+import type { EvidenceMatch, Env } from "../types.js";
+import { normalizeQuery } from "../lib/text.js";
 
-export interface QueryVectorResult {
-  query: string;
-  index: string;
-  matches: VectorMatch[];
-  /** Human-readable supporting-evidence summary (metadata only; never raw code or secrets). */
-  context: string;
-}
+/** Absolute ceiling on matches per query. The cost cap the spec mandates. */
+export const MAX_TOP_K = 3;
 
-export interface QueryVectorOptions {
-  /** Optional metadata filter (requires a metadata index on the filtered field). */
-  filter?: Record<string, unknown>;
-}
-
-const DEFAULT_EMBEDDING_MODEL = "@cf/qwen/qwen3-embedding-0.6b";
+const BLOCKED_KEYS = new Set(
+  config.vector.blockedMetadataKeys.map((k) => k.toLowerCase()),
+);
 
 interface EmbeddingResponse {
   data: number[][];
 }
 
 /**
- * Migrated from the legacy `job-vector` skill.
- *
- * Embeds the query with Workers AI and runs a semantic similarity search against the Vectorize
- * binding to surface supporting evidence / job constraints. The legacy skill reached Vectorize
- * through the job-slack worker's /data gateway with a bearer token; this version uses the native
- * `env.AI.run()` + `env.VECTOR_INDEX.query()` bindings directly, so no gateway or token is needed.
- *
- * All job indices are 1024-dim, cosine. The embedding model matches the legacy system.
+ * Permissive Workers AI run signature. The generated `Ai.run` overloads are
+ * keyed to a curated model union; casting to this shape keeps the call
+ * compiling across workers-types versions and across custom model ids.
+ */
+type AiRun = (model: string, inputs: Record<string, unknown>) => Promise<unknown>;
+
+/** Embeds text server-side with Workers AI and returns the first vector. */
+async function embed(env: Env, text: string): Promise<number[]> {
+  const model = env.EMBEDDING_MODEL || config.embedding.model;
+  const run = env.AI.run as unknown as AiRun;
+  const result = (await run(model, { text: [text] })) as EmbeddingResponse;
+
+  const vector = result?.data?.[0];
+  if (!Array.isArray(vector) || vector.length === 0) {
+    throw new Error(`Embedding model ${model} returned no vector`);
+  }
+  return vector;
+}
+
+/** Builds a human-safe snippet from metadata, skipping blocked/raw fields. */
+function safeSnippet(metadata: Record<string, unknown> | undefined): string {
+  if (!metadata) return "";
+  const pieces: string[] = [];
+  for (const [key, value] of Object.entries(metadata)) {
+    if (BLOCKED_KEYS.has(key.toLowerCase())) continue;
+    if (value == null) continue;
+    if (typeof value === "object") continue; // never spill structured blobs
+    const text = String(value).trim();
+    if (text.length === 0) continue;
+    pieces.push(`${key}: ${text}`);
+  }
+  return pieces.join(" | ").slice(0, 800);
+}
+
+function isVerified(metadata: Record<string, unknown> | undefined): boolean {
+  if (!metadata) return false;
+  return metadata.verified === true || metadata.verified === "true";
+}
+
+/**
+ * Queries the vector index for supporting evidence. `requestedTopK` is clamped
+ * into [1, MAX_TOP_K]. Matches below the configured minScore are dropped.
  */
 export async function queryVectorDatabase(
   env: Env,
   query: string,
-  topK = 5,
-  options: QueryVectorOptions = {},
-): Promise<QueryVectorResult> {
-  const text = query?.trim();
-  if (!text) throw new Error("queryVectorDatabase: 'query' must be a non-empty string.");
+  requestedTopK = MAX_TOP_K,
+): Promise<EvidenceMatch[]> {
+  const normalized = normalizeQuery(query);
+  if (normalized.length === 0) return [];
 
-  // 1. Embed the query server-side.
-  const model = env.EMBEDDING_MODEL || DEFAULT_EMBEDDING_MODEL;
-  const run = env.AI.run as unknown as (
-    m: string,
-    inputs: Record<string, unknown>,
-  ) => Promise<EmbeddingResponse>;
-  const embedding = await run(model, { text: [text] });
-  const vector = embedding?.data?.[0];
-  if (!vector || vector.length === 0) {
-    throw new Error("queryVectorDatabase: embedding returned an empty vector.");
-  }
+  const topK = Math.max(1, Math.min(requestedTopK, MAX_TOP_K));
+  const vector = await embed(env, normalized);
 
-  // 2. Query the Vectorize index for the nearest neighbours.
-  const result = await env.VECTOR_INDEX.query(vector, {
+  const response = await env.VECTOR_INDEX.query(vector, {
     topK,
-    returnMetadata: true,
-    ...(options.filter ? { filter: options.filter as VectorizeVectorMetadataFilter } : {}),
+    returnMetadata: config.vector.returnMetadata as "all",
   });
 
-  const matches: VectorMatch[] = (result.matches ?? []).map((m) => ({
-    id: m.id,
-    score: m.score,
-    metadata: (m.metadata as Record<string, unknown> | undefined) ?? null,
-  }));
-
-  return {
-    query: text,
-    index: "VECTOR_INDEX",
-    matches,
-    context: formatEvidence(matches),
-  };
+  const minScore = config.vector.minScore;
+  return (response.matches || [])
+    .filter((m) => typeof m.score !== "number" || m.score >= minScore)
+    .map((m) => {
+      const metadata = m.metadata as Record<string, unknown> | undefined;
+      return {
+        id: m.id,
+        score: typeof m.score === "number" ? m.score : 0,
+        snippet: safeSnippet(metadata),
+        verified: isVerified(metadata),
+      };
+    })
+    .filter((m) => m.snippet.length > 0);
 }
 
-/**
- * Render matches into a compact evidence summary for the resume builder. Uses only metadata
- * fields (title / summary / score). Honors the RAG rule from the legacy system: never surface raw
- * code or secrets, and phrase unverified records (`verified: false`) conservatively.
- */
-function formatEvidence(matches: VectorMatch[]): string {
-  if (matches.length === 0) return "No supporting evidence found in the vector index.";
-  const lines = matches.map((m, i) => {
-    const meta = m.metadata ?? {};
-    const title =
-      (typeof meta.title === "string" && meta.title) ||
-      (typeof meta.name === "string" && meta.name) ||
-      m.id;
-    const summary =
-      (typeof meta.summary === "string" && meta.summary) ||
-      (typeof meta.description === "string" && meta.description) ||
-      "";
-    const verified = meta.verified === false ? " (unverified lead, phrase conservatively)" : "";
-    const score = m.score.toFixed(3);
-    return `${i + 1}. [${score}] ${title}${summary ? `: ${summary}` : ""}${verified}`;
-  });
-  return lines.join("\n");
+/** Joins evidence matches into a single framing-context string for the resume prompt. */
+export function evidenceToContext(matches: EvidenceMatch[]): string {
+  if (matches.length === 0) return "";
+  return matches
+    .map((m, i) => {
+      const tag = m.verified ? "verified" : "unverified lead — phrase conservatively";
+      return `[${i + 1}] (${tag}, score ${m.score.toFixed(3)}) ${m.snippet}`;
+    })
+    .join("\n");
 }

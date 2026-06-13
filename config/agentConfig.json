@@ -1,52 +1,43 @@
 {
-  "name": "composer",
-  "displayName": "Conductor (migrated)",
-  "description": "Auto-assembles a tailored job application end to end: queries vector evidence, researches the company against hard criteria, and synthesizes a one-page resume. Human-gated before any external submit. Migrated from the Hyperagent Conductor agent.",
-  "origin": {
-    "platform": "hyperagent",
-    "legacyAgentId": "cmqbq25zb167m06adozw7bqxv",
-    "legacyAgentName": "Conductor",
-    "migratedFrom": ["job-vector", "job-research", "job-resume"]
+  "$schema_note": "Central, code-free tuning surface for Composer. Edit values here; src reads this at bundle time.",
+  "version": 1,
+  "cache": {
+    "keyPrefix": "research",
+    "ttlSeconds": 604800,
+    "ttlHumanReadable": "7 days"
   },
-  "persona": {
-    "executionMode": "confirm",
-    "humanGate": true,
-    "neverFabricate": true,
-    "sourceOfTruth": "source.yml in R2 (read-only)"
+  "browser": {
+    "navigationTimeoutMs": 20000,
+    "waitUntil": "domcontentloaded",
+    "maxTextChars": 20000,
+    "maxHeadings": 60,
+    "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
   },
-  "model": {
-    "provider": "cloudflare-workers-ai",
-    "embeddingModel": "@cf/qwen/qwen3-embedding-0.6b",
-    "embeddingDim": 1024,
-    "resumeModel": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
-    "legacyOrchestratorModel": "opus-latest"
+  "embedding": {
+    "model": "@cf/qwen/qwen3-embedding-0.6b",
+    "dimensions": 1024
   },
-  "vectorize": {
-    "binding": "VECTOR_INDEX",
-    "defaultIndex": "source-code-rag",
-    "metric": "cosine",
-    "dimensions": 1024,
-    "indices": [
-      { "name": "job-company", "purpose": "company research cache" },
-      { "name": "job-people", "purpose": "interviewer / people research cache" },
-      { "name": "job-role", "purpose": "role research cache" },
-      { "name": "source-code-rag", "purpose": "supporting technical project evidence for the resume" }
-    ]
+  "vector": {
+    "topK": 3,
+    "returnMetadata": "all",
+    "minScore": 0.0,
+    "blockedMetadataKeys": ["secret", "credential", "raw_code", "token", "api_key"]
   },
-  "r2": {
-    "binding": "JOB_SOURCE",
-    "bucket": "job-source",
-    "keys": {
-      "sourceOfTruth": "source.yml",
-      "baseResume": "BASE_RESUME.html",
-      "tuningLedger": "tuning/insights.json"
+  "modelRouting": {
+    "tier": "edge",
+    "edge": {
+      "provider": "workers-ai",
+      "model": "@cf/meta/llama-3-8b-instruct",
+      "maxTokens": 1200,
+      "temperature": 0.2
+    },
+    "premium": {
+      "provider": "anthropic",
+      "model": "claude-3-5-sonnet-20241022",
+      "anthropicVersion": "2023-06-01",
+      "maxTokens": 4096,
+      "temperature": 0.2,
+      "requiresGateway": true
     }
-  },
-  "hardCriteria": {
-    "minCompUsd": 200000,
-    "requiresWebTech": true,
-    "avoidPrimaryLanguages": ["python", "go"],
-    "commute": { "driveMaxSeconds": 1500, "transitMaxSeconds": 2400 }
-  },
-  "pipeline": ["queryVectorDatabase", "researchCompany", "buildResume"]
+  }
 }
