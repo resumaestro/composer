@@ -1,0 +1,43 @@
+name = "composer"
+main = "src/index.ts"
+compatibility_date = "2025-06-01"
+
+# --- Workers AI (embeddings + resume synthesis) ---
+[ai]
+binding = "AI"
+
+# --- Vectorize (semantic evidence search) ---
+# The single binding the skills use. Defaults to the source-code-rag index (supporting evidence
+# for the resume). All job indices are 1024-dim, cosine. Swap index_name or add more bindings
+# (job-company / job-people / job-role) as your routing needs grow.
+[[vectorize]]
+binding = "VECTOR_INDEX"
+index_name = "source-code-rag"
+
+# Additional legacy indices (uncomment + give each a distinct binding to use them):
+# [[vectorize]]
+# binding = "VECTOR_COMPANY"
+# index_name = "job-company"
+# [[vectorize]]
+# binding = "VECTOR_PEOPLE"
+# index_name = "job-people"
+# [[vectorize]]
+# binding = "VECTOR_ROLE"
+# index_name = "job-role"
+
+# --- R2 (source.yml, BASE_RESUME.html, research payloads) ---
+[[r2_buckets]]
+binding = "JOB_SOURCE"
+bucket_name = "job-source"
+
+# --- Non-secret configuration (safe to commit) ---
+[vars]
+EMBEDDING_MODEL = "@cf/qwen/qwen3-embedding-0.6b"
+RESUME_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+COMMUTE_WORKER_URL = "https://geoapify-commute-worker.cameronaziz.workers.dev"
+SEARCH_API_URL = "https://api.tavily.com/search"
+CALLBACK_BASE_URL = ""
+
+# --- Secrets (DO NOT put values here; set them with `wrangler secret put <NAME>`) ---
+#   wrangler secret put TAVILY_API_KEY   # web search API key used by researchCompany
+#   wrangler secret put ROZZY_KEY        # x-rozzy-key header for the commute worker
