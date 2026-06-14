@@ -1,6 +1,6 @@
 import type { Env } from "../index";
 import agentConfig from "../../config/agentConfig.json";
-import { HARD_CRITERIA_SUMMARY, RESEARCH_GUIDELINES } from "../../config/prompts";
+import { HARD_CRITERIA_SUMMARY, RESEARCH_GUIDELINES, TONE_DETERMINATION_PROMPT } from "../../config/prompts";
 
 export interface ResearchSignal {
   title: string;
@@ -26,9 +26,16 @@ export interface CompanyResearch {
   rejected: boolean;
   rejectionReason?: string;
   researchedAt: string;
+  /** R2 key where the full research payload is stored. */
+  r2Key: string;
 }
 
 export interface ResearchOptions {
+  jobId: string;
+  depth?: 'quick' | 'standard' | 'deep';
+  facets?: string[];
+  manager_name?: string;
+  concern?: string;
   address?: string;
   workType?: "remote" | "hybrid" | "onsite";
   jobText?: string;
@@ -36,6 +43,7 @@ export interface ResearchOptions {
 
 const DEFAULT_SEARCH_API_URL = "https://api.tavily.com/search";
 const DEFAULT_COMMUTE_URL = "https://geoapify-commute-worker.cameronaziz.workers.dev";
+const DEFAULT_EMBEDDING_MODEL = "@cf/qwen/qwen3-embedding-0.6b";
 
 interface TavilyResult {
   title?: string;
@@ -54,67 +62,323 @@ interface ScreenResult {
   rejectionReason?: string;
 }
 
+interface EmbeddingResponse {
+  data: number[][];
+}
+
+interface ChatResponse {
+  response: string;
+}
+
+// --- gateway helpers ---
+
+async function gatewayGetR2(env: Env, key: string): Promise<string | null> {
+  const base = (env.RESUMAESTRO_URL ?? '').replace(/\/+$/, '');
+  if (!base) return null;
+  const res = await fetch(`${base}/data/r2?key=${encodeURIComponent(key)}`, {
+    headers: { authorization: `Bearer ${env.ROZZY_KEY ?? ''}` },
+  });
+  if (!res.ok) return null;
+  return res.text();
+}
+
+async function gatewayPutR2(env: Env, key: string, body: string, contentType: string): Promise<void> {
+  const base = (env.RESUMAESTRO_URL ?? '').replace(/\/+$/, '');
+  if (!base) return;
+  await fetch(`${base}/data/r2?key=${encodeURIComponent(key)}`, {
+    method: 'PUT',
+    headers: {
+      'content-type': contentType,
+      authorization: `Bearer ${env.ROZZY_KEY ?? ''}`,
+    },
+    body,
+  });
+}
+
+async function gatewayPutKV(env: Env, key: string, value: string): Promise<void> {
+  const base = (env.RESUMAESTRO_URL ?? '').replace(/\/+$/, '');
+  if (!base) return;
+  await fetch(`${base}/data/kv/${encodeURIComponent(key)}`, {
+    method: 'PUT',
+    headers: {
+      'content-type': 'text/plain; charset=utf-8',
+      authorization: `Bearer ${env.ROZZY_KEY ?? ''}`,
+    },
+    body: value,
+  });
+}
+
+async function gatewayVectorUpsert(
+  env: Env,
+  vectors: Array<{ id: string; values: number[]; metadata: Record<string, unknown> }>,
+): Promise<void> {
+  const base = (env.RESUMAESTRO_URL ?? '').replace(/\/+$/, '');
+  if (!base) return;
+  await fetch(`${base}/data/vector/upsert`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: `Bearer ${env.ROZZY_KEY ?? ''}`,
+    },
+    body: JSON.stringify({ vectors }),
+  });
+}
+
+async function queryExistingResearch(env: Env, company: string): Promise<string | null> {
+  const model = DEFAULT_EMBEDDING_MODEL;
+  const run = env.AI.run as unknown as (
+    m: string,
+    inputs: Record<string, unknown>,
+  ) => Promise<EmbeddingResponse>;
+  const embedding = await run(model, { text: [company] });
+  const vector = embedding?.data?.[0];
+  if (!vector || vector.length === 0) return null;
+
+  const result = await env.RESUMAESTRO_COMPANIES.query(vector, {
+    topK: 1,
+    returnMetadata: true,
+  });
+  const match = result.matches?.at(0);
+  if (!match) return null;
+
+  const meta = match.metadata as Record<string, unknown> | undefined;
+  const researchedAt = typeof meta?.researchedAt === 'string' ? meta.researchedAt : null;
+  const summary = typeof meta?.summary === 'string' ? meta.summary : null;
+
+  if (
+    match.score > 0.92 &&
+    researchedAt !== null &&
+    summary !== null &&
+    (Date.now() - new Date(researchedAt).getTime()) < 30 * 24 * 60 * 60 * 1000
+  ) {
+    return summary;
+  }
+  return null;
+}
+
+async function determineTone(env: Env, signals: ResearchSignal[], company: string): Promise<'formal' | 'conversational' | 'technical'> {
+  const run = env.AI.run as unknown as (
+    m: string,
+    inputs: Record<string, unknown>,
+  ) => Promise<ChatResponse>;
+  const model = env.RESUME_MODEL || '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
+  const signalText = signals.slice(0, 6).map((s) => `${s.title}: ${s.snippet}`).join('\n\n');
+  const result = await run(model, {
+    messages: [
+      { role: 'system', content: TONE_DETERMINATION_PROMPT },
+      {
+        role: 'user',
+        content: `Company: ${company}\n\nResearch signals:\n${signalText}`,
+      },
+    ],
+    max_tokens: 64,
+    temperature: 0,
+  });
+  try {
+    const raw = (result?.response ?? '').trim().replace(/^```[a-z]*\n?/i, '').replace(/\n?```$/, '').trim();
+    const parsed = JSON.parse(raw) as { tone?: string };
+    const tone = parsed.tone;
+    if (tone === 'formal' || tone === 'conversational' || tone === 'technical') return tone;
+  } catch {
+    // fall through
+  }
+  return 'conversational';
+}
+
 /**
- * Migrated from the legacy `job-research` skill.
- *
- * Orchestrates outbound intelligence gathering with standard web `fetch()` calls: a web search
- * pass for company signals (funding, team, culture, news) and an optional commute check against
- * the geoapify commute worker. It then screens the role against the candidate's hard criteria and
- * produces a fit score. No fabricated facts: everything reported here is sourced from fetched data.
+ * Orchestrates outbound company intelligence: web search, optional commute check, hard-criteria
+ * screen, fit scoring, tone determination, and synthesis. Persists to R2, KV, and Vectorize.
+ * Returns the deep_research result shape consumed by index.ts -> postCallback.
  */
 export async function researchCompany(
   env: Env,
   company: string,
-  options: ResearchOptions = {},
-): Promise<CompanyResearch> {
+  options: ResearchOptions,
+): Promise<Record<string, unknown>> {
   const name = company?.trim();
   if (!name) throw new Error("researchCompany: 'company' must be a non-empty string.");
 
-  // 1. Outbound web intelligence.
-  const signals = await webSearch(env, name);
+  // 1. Check for cached research in Vectorize.
+  const cached = await queryExistingResearch(env, name);
+  if (cached) {
+    // Read experience.yml to synthesize brief from cache
+    const experienceYml = await gatewayGetR2(env, 'source/experience.yml');
+    const brief = [
+      `# ${name} — Research Brief (Cached)`,
+      '',
+      cached,
+      '',
+      experienceYml ? `## Candidate Profile\n${experienceYml.slice(0, 2000)}` : '',
+    ].join('\n');
 
-  // 2. Optional commute check for hybrid / onsite roles.
+    const tone_suggestion = await determineTone(env, [], name);
+
+    return {
+      type: 'research',
+      summary: cached,
+      signals_json: JSON.stringify([]),
+      sources_json: JSON.stringify([]),
+      brief_key: `research/${options.jobId}/brief.md`,
+      tone_suggestion,
+    };
+  }
+
+  // 2. Outbound web intelligence.
+  const signals = await webSearch(env, name, options);
+
+  // 3. Save raw Tavily results to R2.
+  const rawKey = `research/${options.jobId}/raw.json`;
+  await gatewayPutR2(env, rawKey, JSON.stringify(signals), 'application/json');
+
+  // 4. Optional commute check for hybrid / onsite roles.
   let commute: CommuteResult | null = null;
   if (options.address && (options.workType === "hybrid" || options.workType === "onsite")) {
     commute = await commuteCheck(env, options.address);
   }
 
-  // 3. Hard-criteria screen + fit scoring.
+  // 5. Hard-criteria screen + fit scoring.
   const screen = screenRole(options.jobText ?? "", options.workType, commute);
 
   const sources = signals.map((s) => s.url).filter((u) => u.length > 0);
+
+  // 6. Read experience.yml for synthesis.
+  const experienceYml = await gatewayGetR2(env, 'source/experience.yml');
+
+  // 7. Build summary / brief.
   const summary = buildSummary(name, signals, screen, commute);
+  const researchedAt = new Date().toISOString();
+
+  const brief = [
+    summary,
+    '',
+    experienceYml ? `## Candidate Profile\n${experienceYml.slice(0, 2000)}` : '',
+  ].join('\n');
+
+  // 8. Determine tone.
+  const tone_suggestion = await determineTone(env, signals, name);
+
+  // 9. Persist — fire storage operations in parallel; don't let storage failures abort.
+  const briefKey = `research/${options.jobId}/brief.md`;
+  const kvKey = `research:${options.jobId}`;
+
+  await Promise.allSettled([
+    gatewayPutR2(env, briefKey, brief, 'text/markdown; charset=utf-8'),
+    gatewayPutKV(env, kvKey, brief),
+    writeVector(env, options.jobId, name, summary, options.facets ?? [], researchedAt),
+  ]);
 
   return {
-    company: name,
+    type: 'research',
     summary,
-    signals,
-    sources,
-    commute,
-    flags: screen.flags,
-    fitScore: screen.fitScore,
-    rejected: screen.rejected,
-    rejectionReason: screen.rejectionReason,
-    researchedAt: new Date().toISOString(),
+    signals_json: JSON.stringify(signals),
+    sources_json: JSON.stringify(sources),
+    brief_key: briefKey,
+    tone_suggestion,
   };
 }
 
-/** Web search via the configured search API (Tavily-compatible POST). */
-async function webSearch(env: Env, company: string): Promise<ResearchSignal[]> {
-  if (!env.TAVILY_API_KEY) {
-    throw new Error(
-      "researchCompany: TAVILY_API_KEY is not configured. Set it with `wrangler secret put TAVILY_API_KEY`.",
-    );
+// --- persistence helpers ---
+
+function encodeR2Segment(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9-]/g, "-").replace(/-+/g, "-");
+}
+
+async function writeVector(
+  env: Env,
+  jobId: string,
+  company: string,
+  summary: string,
+  facets: string[],
+  researchedAt: string,
+): Promise<void> {
+  const model = DEFAULT_EMBEDDING_MODEL;
+  const run = env.AI.run as unknown as (
+    m: string,
+    inputs: Record<string, unknown>,
+  ) => Promise<EmbeddingResponse>;
+  const embedding = await run(model, { text: [summary] });
+  const vector = embedding?.data?.[0];
+  if (!vector || vector.length === 0) return;
+
+  await gatewayVectorUpsert(env, [
+    {
+      id: `${encodeR2Segment(company)}:${jobId}`,
+      values: vector,
+      metadata: { company, jobId, facets: JSON.stringify(facets), researchedAt, summary },
+    },
+  ]);
+}
+
+// --- web search ---
+
+interface TavilyQuery {
+  q: string;
+  depth: string;
+  exact_match?: boolean;
+}
+
+function buildQueries(company: string, options: ResearchOptions): TavilyQuery[] {
+  const depth = options.depth ?? 'standard';
+  const facets = options.facets ?? [];
+  const managerName = options.manager_name;
+
+  if (depth === 'quick') {
+    return [{ q: `${company} company overview red flags`, depth: 'basic' }];
   }
-  const endpoint = env.SEARCH_API_URL || DEFAULT_SEARCH_API_URL;
-  const query = `${company} company funding investors leadership team culture engineering recent news`;
+
+  if (depth === 'standard') {
+    return [{ q: `${company} company overview culture engineering`, depth: 'basic' }];
+  }
+
+  // deep: base + one per facet
+  const queries: TavilyQuery[] = [
+    { q: `${company} company overview culture engineering`, depth: 'basic' },
+  ];
+
+  for (const facet of facets) {
+    switch (facet) {
+      case 'vision':
+        queries.push({ q: `${company} vision strategy roadmap executives 2025`, depth: 'advanced' })
+        break
+      case 'funding':
+        queries.push({ q: `${company} funding investors revenue business model moat`, depth: 'advanced' })
+        break
+      case 'culture':
+        queries.push({ q: `${company} engineering culture glassdoor work life balance wfh`, depth: 'advanced' })
+        break
+      case 'tech_stack':
+        queries.push({ q: `${company} tech stack architecture engineering github open source`, depth: 'advanced' })
+        break
+      case 'red_flags':
+        queries.push({ q: `${company} lawsuit layoffs compliance issues controversy`, depth: 'advanced' })
+        break
+      case 'manager':
+        if (managerName) {
+          queries.push({ q: `"${managerName}" ${company} career background interviews`, depth: 'advanced', exact_match: true })
+        } else {
+          queries.push({ q: `site:linkedin.com "${company}" engineering manager hiring`, depth: 'advanced' })
+        }
+        break
+      default:
+        break
+    }
+  }
+
+  return queries;
+}
+
+async function runTavilyQuery(
+  endpoint: string,
+  apiKey: string,
+  query: TavilyQuery,
+): Promise<ResearchSignal[]> {
   const response = await fetch(endpoint, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      api_key: env.TAVILY_API_KEY,
-      query,
-      search_depth: "advanced",
+      api_key: apiKey,
+      query: query.q,
+      search_depth: query.depth,
       max_results: 8,
       include_answer: true,
     }),
@@ -126,13 +390,41 @@ async function webSearch(env: Env, company: string): Promise<ResearchSignal[]> {
   }
   const data = (await response.json()) as TavilyResponse;
   return (data.results ?? []).map((r) => ({
-    title: r.title ?? "",
-    url: r.url ?? "",
-    snippet: (r.content ?? "").slice(0, 500),
+    title: r.title ?? '',
+    url: r.url ?? '',
+    snippet: (r.content ?? '').slice(0, 500),
   }));
 }
 
-/** Commute check against the geoapify commute worker (POST /route/address, x-rozzy-key header). */
+async function webSearch(env: Env, company: string, options: ResearchOptions): Promise<ResearchSignal[]> {
+  if (!env.TAVILY_API_KEY) {
+    throw new Error(
+      "researchCompany: TAVILY_API_KEY is not configured. Set it with `wrangler secret put TAVILY_API_KEY`.",
+    );
+  }
+  const endpoint = env.SEARCH_API_URL || DEFAULT_SEARCH_API_URL;
+  const queries = buildQueries(company, options);
+
+  const resultSets = await Promise.all(
+    queries.map((query) => runTavilyQuery(endpoint, env.TAVILY_API_KEY!, query)),
+  );
+
+  // Flatten and dedupe by URL (keep first occurrence).
+  const seen = new Set<string>();
+  const signals: ResearchSignal[] = [];
+  for (const set of resultSets) {
+    for (const signal of set) {
+      if (!seen.has(signal.url)) {
+        seen.add(signal.url);
+        signals.push(signal);
+      }
+    }
+  }
+  return signals;
+}
+
+// --- commute check ---
+
 async function commuteCheck(env: Env, address: string): Promise<CommuteResult> {
   if (!env.ROZZY_KEY) {
     throw new Error(
@@ -156,14 +448,14 @@ async function commuteCheck(env: Env, address: string): Promise<CommuteResult> {
   };
   const driveSeconds = data.routes?.drive?.durationSeconds ?? null;
   const transitSeconds = data.routes?.transit?.durationSeconds ?? null;
-  // Pass if drive OR transit is within its threshold (matches the legacy rule).
   const withinLimits =
     (driveSeconds !== null && driveSeconds <= driveMax) ||
     (transitSeconds !== null && transitSeconds <= transitMax);
   return { address, driveSeconds, transitSeconds, withinLimits };
 }
 
-/** Screen the role against the candidate's hard criteria and compute a coarse fit score. */
+// --- hard-criteria screen ---
+
 function screenRole(
   jobText: string,
   workType: ResearchOptions["workType"],
@@ -174,7 +466,6 @@ function screenRole(
   const reasons: string[] = [];
   const minComp = agentConfig.hardCriteria.minCompUsd;
 
-  // Salary detection.
   const salaries = extractSalaries(jobText);
   const topSalary = salaries.length > 0 ? Math.max(...salaries) : null;
   if (topSalary !== null && topSalary < minComp) {
@@ -184,7 +475,6 @@ function screenRole(
   }
   if (jobText && topSalary === null) flags.push("no salary range stated");
 
-  // Web technology requirement.
   const webTerms = [
     "web", "frontend", "front-end", "front end", "browser", "ui", "react",
     "typescript", "javascript", "css", "html", "vue", "svelte", "angular",
@@ -194,7 +484,6 @@ function screenRole(
     reasons.push("posting does not mention web, frontend, browser, or UI technologies");
   }
 
-  // Primary Python / Go as a core language.
   for (const lang of agentConfig.hardCriteria.avoidPrimaryLanguages) {
     const re = new RegExp(
       `\\b(primary|core|strong|expert|proficient|deep)\\b[^.]{0,40}\\b${lang}\\b` +
@@ -206,14 +495,12 @@ function screenRole(
     }
   }
 
-  // Commute (only relevant for hybrid / onsite).
   if ((workType === "hybrid" || workType === "onsite") && commute && !commute.withinLimits) {
     reasons.push(
       `commute exceeds limits (drive ${secs(commute.driveSeconds)}, transit ${secs(commute.transitSeconds)})`,
     );
   }
 
-  // Non-blocking flags.
   if (workType === "onsite") flags.push("onsite role");
   if (workType === "hybrid") flags.push("hybrid role");
 
@@ -234,14 +521,12 @@ function extractSalaries(text: string): number[] {
   const out: number[] = [];
   let m: RegExpExecArray | null;
 
-  // $200,000 / $200000
   const full = /\$\s?(\d{3}(?:,\d{3})+|\d{4,7})/g;
   while ((m = full.exec(text)) !== null) {
     const value = Number(m[1].replace(/,/g, ""));
     if (value >= 10000) out.push(value);
   }
 
-  // $200k / 200K
   const shorthand = /\$?\s?(\d{2,4})\s?[kK]\b/g;
   while ((m = shorthand.exec(text)) !== null) {
     const value = Number(m[1]) * 1000;

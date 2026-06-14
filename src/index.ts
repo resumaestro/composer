@@ -1,5 +1,9 @@
 import agentConfig from "../config/agentConfig.json";
-import { runPipeline, type PipelineInput, type WorkType } from "./agent";
+import { surfaceScan } from "./skills/surfaceScan";
+import { researchCompany } from "./skills/researchCompany";
+import { buildResume } from "./skills/buildResume";
+import { refineResume } from "./skills/refineResume";
+import { applyToJob } from "./skills/applyToJob";
 
 /**
  * Cloudflare Worker bindings. Configure the resource bindings + vars in wrangler.toml, and set
@@ -8,10 +12,20 @@ import { runPipeline, type PipelineInput, type WorkType } from "./agent";
 export interface Env {
   /** Workers AI binding (embeddings + resume synthesis). */
   AI: Ai;
-  /** Vectorize index binding (defaults to source-code-rag; see wrangler.toml). */
+  /** Candidate experience chunks — read-only, ingested separately. */
   VECTOR_INDEX: VectorizeIndex;
-  /** R2 bucket holding source.yml, BASE_RESUME.html, and research payloads. */
-  JOB_SOURCE: R2Bucket;
+  /** Company research cache — written after researchCompany. */
+  RESUMAESTRO_COMPANIES: VectorizeIndex;
+  /** People research cache — written by future people-research skill. */
+  RESUMAESTRO_TEAMMEMBERS: VectorizeIndex;
+  /** Role / job-description cache — written after buildResume. */
+  RESUMAESTRO_ROLES: VectorizeIndex;
+  /** D1 database for queryable pipeline records. */
+  DB: D1Database;
+  /** R2 bucket: source files (read) + research/resume outputs (write). */
+  RESUMAESTRO_SOURCE: R2Bucket;
+  /** KV namespace for fast retrieval of briefs and cached answers. */
+  RESUMAESTRO_KV: KVNamespace;
 
   // vars (wrangler.toml [vars])
   EMBEDDING_MODEL?: string;
@@ -19,10 +33,31 @@ export interface Env {
   COMMUTE_WORKER_URL?: string;
   SEARCH_API_URL?: string;
   CALLBACK_BASE_URL?: string;
+  /** Base URL for the resumaestro data gateway (bearer-authenticated). */
+  RESUMAESTRO_URL?: string;
+  /** Public URL of this worker (used for self-referencing if needed). */
+  WORKER_URL?: string;
 
   // secrets (wrangler secret put ...)
   TAVILY_API_KEY?: string;
   ROZZY_KEY?: string;
+}
+
+type AgentMode = 'surface_scan' | 'deep_research' | 'tailor' | 'refine' | 'apply'
+
+type AgentPayload = {
+  mode: AgentMode
+  job_id: string
+  callback_url: string
+  listing_url?: string
+  depth?: 'quick' | 'standard' | 'deep'
+  facets?: string[]
+  manager_name?: string
+  concern?: string
+  feedback?: string
+  grade?: string
+  emphasis?: string
+  company?: string
 }
 
 function json(body: unknown, status = 200): Response {
@@ -32,72 +67,92 @@ function json(body: unknown, status = 200): Response {
   });
 }
 
-/** Validate and normalize an incoming job request payload. */
-function parsePipelineInput(raw: unknown): { input?: PipelineInput; error?: string } {
-  if (typeof raw !== "object" || raw === null) {
-    return { error: "Request body must be a JSON object." };
-  }
-  const body = raw as Record<string, unknown>;
-
-  const company = typeof body.company === "string" ? body.company.trim() : "";
-  if (!company) {
-    return { error: "Field 'company' is required and must be a non-empty string." };
-  }
-
-  const query =
-    typeof body.query === "string" && body.query.trim()
-      ? body.query.trim()
-      : typeof body.jobDescription === "string"
-        ? body.jobDescription.trim()
-        : "";
-  if (!query) {
-    return { error: "One of 'query' or 'jobDescription' is required." };
-  }
-
-  const workType: WorkType | undefined =
-    body.workType === "remote" || body.workType === "hybrid" || body.workType === "onsite"
-      ? body.workType
-      : undefined;
-
-  const input: PipelineInput = {
-    jobId: typeof body.id === "string" && body.id ? body.id : crypto.randomUUID(),
-    company,
-    query,
-    jobDescription: typeof body.jobDescription === "string" ? body.jobDescription : undefined,
-    address: typeof body.address === "string" ? body.address : undefined,
-    workType,
-    topK: typeof body.topK === "number" ? body.topK : undefined,
-    callbackUrl: typeof body.callbackUrl === "string" ? body.callbackUrl : undefined,
-  };
-  return { input };
-}
-
-/** POST the pipeline result back to the platform's async callback endpoint. */
-async function postResult(base: string, jobId: string, payload: unknown): Promise<void> {
-  const url = `${base.replace(/\/+$/, "")}/jobs/${encodeURIComponent(jobId)}/result`;
-  await fetch(url, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-}
-
-/** Run the orchestrated pipeline and deliver the result to the callback (if configured). */
-async function processJob(env: Env, input: PipelineInput): Promise<void> {
-  const callbackBase = input.callbackUrl ?? env.CALLBACK_BASE_URL;
+async function dispatchMode(env: Env, payload: AgentPayload): Promise<void> {
   try {
-    const result = await runPipeline(env, input);
-    if (callbackBase) await postResult(callbackBase, input.jobId, result);
+    const result = await runMode(env, payload)
+    await postCallback(payload.callback_url, payload.job_id, payload.mode, result)
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    if (callbackBase) {
-      await postResult(callbackBase, input.jobId, {
-        jobId: input.jobId,
-        status: "error",
-        error: message,
-      });
+    const message = err instanceof Error ? err.message : String(err)
+    await postCallback(payload.callback_url, payload.job_id, payload.mode, {
+      job_id: payload.job_id,
+      type: 'error',
+      error: message,
+    })
+  }
+}
+
+async function runMode(env: Env, payload: AgentPayload): Promise<Record<string, unknown>> {
+  switch (payload.mode) {
+    case 'surface_scan':
+      return surfaceScan(env, payload)
+    case 'deep_research':
+      return runDeepResearch(env, payload)
+    case 'tailor':
+      return buildResume(env, payload)
+    case 'refine':
+      return refineResume(env, payload)
+    case 'apply':
+      return runApply(env, payload)
+    default:
+      throw new Error(`Unknown mode: ${payload.mode}`)
+  }
+}
+
+/** POST the pipeline result back to the platform's async callback endpoint.
+ *  On failure, attempts a recovery POST to /error so resumaestro can clear in_flight.
+ */
+async function postCallback(
+  callbackUrl: string,
+  jobId: string,
+  mode: string,
+  payload: unknown,
+): Promise<void> {
+  try {
+    await fetch(callbackUrl, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e)
+    const errorUrl = callbackUrl.replace('/result', '/error')
+    await fetch(errorUrl, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ mode, error: message, errorType: 'transient' }),
+    }).catch(() => {})
+  }
+}
+
+async function runDeepResearch(env: Env, payload: AgentPayload): Promise<Record<string, unknown>> {
+  const company = payload.company ?? ''
+  if (!company) {
+    return {
+      type: 'research',
+      job_id: payload.job_id,
+      summary: null,
+      signals_json: JSON.stringify([]),
+      sources_json: JSON.stringify([]),
+      brief_key: null,
+      tone_suggestion: null,
+      error: 'company name is required for deep_research',
     }
   }
+  return researchCompany(env, company, {
+    jobId: payload.job_id,
+    depth: payload.depth ?? 'standard',
+    facets: payload.facets ?? [],
+    manager_name: payload.manager_name,
+    concern: payload.concern,
+  })
+}
+
+async function runApply(env: Env, payload: AgentPayload): Promise<Record<string, unknown>> {
+  const result = await applyToJob(env, {
+    jobId: payload.job_id,
+    emphasis: payload.emphasis,
+  });
+  return result as unknown as Record<string, unknown>;
 }
 
 export default {
@@ -110,37 +165,22 @@ export default {
         ok: true,
         service: agentConfig.name,
         description: agentConfig.description,
-        pipeline: agentConfig.pipeline,
-        usage: "POST / or POST /jobs with { company, query | jobDescription, id?, callbackUrl? }",
+        usage: "POST /agent with { mode, job_id, callback_url, ...modeParams }",
       });
     }
 
-    // Kick off a job.
-    if (request.method === "POST" && (url.pathname === "/" || url.pathname === "/jobs")) {
-      let raw: unknown;
+    if (request.method === "POST" && url.pathname === "/agent") {
+      let body: AgentPayload
       try {
-        raw = await request.json();
+        body = await request.json() as AgentPayload
       } catch {
-        return json({ error: "Invalid JSON body." }, 400);
+        return json({ error: 'Invalid JSON body.' }, 400)
       }
-
-      const { input, error } = parsePipelineInput(raw);
-      if (error || !input) return json({ error: error ?? "Invalid request." }, 400);
-
-      // Async callback flow: acknowledge immediately, deliver the result to /jobs/:id/result.
-      if (input.callbackUrl || env.CALLBACK_BASE_URL) {
-        ctx.waitUntil(processJob(env, input));
-        return json({ accepted: true, jobId: input.jobId, status: "processing" }, 202);
+      if (!body.mode || !body.job_id || !body.callback_url) {
+        return json({ error: 'mode, job_id, and callback_url are required.' }, 400)
       }
-
-      // Synchronous mode: no callback configured, return the result inline.
-      try {
-        const result = await runPipeline(env, input);
-        return json(result);
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        return json({ jobId: input.jobId, status: "error", error: message }, 500);
-      }
+      ctx.waitUntil(dispatchMode(env, body))
+      return json({ accepted: true, jobId: body.job_id }, 202)
     }
 
     return json({ error: "Not found." }, 404);

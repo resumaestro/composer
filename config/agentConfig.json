@@ -1,52 +1,55 @@
 {
-  "name": "composer",
-  "displayName": "Conductor (migrated)",
-  "description": "Auto-assembles a tailored job application end to end: queries vector evidence, researches the company against hard criteria, and synthesizes a one-page resume. Human-gated before any external submit. Migrated from the Hyperagent Conductor agent.",
-  "origin": {
-    "platform": "hyperagent",
-    "legacyAgentId": "cmqbq25zb167m06adozw7bqxv",
-    "legacyAgentName": "Conductor",
-    "migratedFrom": ["job-vector", "job-research", "job-resume"]
-  },
+  "name": "resumaestro-composer",
+  "displayName": "Composer",
+  "description": "Auto-assembles a tailored job application end to end: queries vector evidence, researches the company against hard criteria, and synthesizes a one-page resume. Human-gated before any external submit.",
   "persona": {
     "executionMode": "confirm",
     "humanGate": true,
     "neverFabricate": true,
-    "sourceOfTruth": "source.yml in R2 (read-only)"
+    "sourceOfTruth": "source/experience.yml in R2 (read-only)"
+  },
+  "models": {
+    "fast": "claude-haiku-4-5",
+    "standard": "claude-sonnet-4-6",
+    "powerful": "claude-sonnet-4-6"
   },
   "model": {
     "provider": "cloudflare-workers-ai",
     "embeddingModel": "@cf/qwen/qwen3-embedding-0.6b",
     "embeddingDim": 1024,
-    "resumeModel": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
-    "legacyOrchestratorModel": "opus-latest"
+    "resumeModel": "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
   },
   "vectorize": {
-    "binding": "VECTOR_INDEX",
-    "defaultIndex": "source-code-rag",
-    "metric": "cosine",
-    "dimensions": 1024,
     "indices": [
-      { "name": "job-company", "purpose": "company research cache" },
-      { "name": "job-people", "purpose": "interviewer / people research cache" },
-      { "name": "job-role", "purpose": "role research cache" },
-      { "name": "source-code-rag", "purpose": "supporting technical project evidence for the resume" }
-    ]
+      { "binding": "VECTOR_INDEX",           "index": "source-code-rag",          "purpose": "candidate experience chunks (read-only)" },
+      { "binding": "RESUMAESTRO_COMPANIES",   "index": "resumaestro-companies",    "purpose": "company research cache (written by researchCompany)" },
+      { "binding": "RESUMAESTRO_TEAMMEMBERS", "index": "resumaestro-teammembers",  "purpose": "people research cache (written by future people-research skill)" },
+      { "binding": "RESUMAESTRO_ROLES",       "index": "resumaestro-roles",        "purpose": "role/job-description cache (written by buildResume)" }
+    ],
+    "metric": "cosine",
+    "dimensions": 1024
   },
   "r2": {
-    "binding": "JOB_SOURCE",
-    "bucket": "job-source",
+    "binding": "RESUMAESTRO_SOURCE",
+    "bucket": "resumaestro-source",
     "keys": {
-      "sourceOfTruth": "source.yml",
-      "baseResume": "BASE_RESUME.html",
-      "tuningLedger": "tuning/insights.json"
+      "sourceOfTruth": "source/experience.yml",
+      "baseResume": "source/resume.html",
+      "research": "research/{jobId}/raw.json",
+      "brief": "research/{jobId}/brief.md",
+      "resume": "resumes/{jobId}/v{n}.md",
+      "listing": "listings/{jobId}.html"
     }
+  },
+  "d1": {
+    "binding": "DB",
+    "database": "resumaestro-pipeline",
+    "tables": ["research", "resumes"]
   },
   "hardCriteria": {
     "minCompUsd": 200000,
     "requiresWebTech": true,
     "avoidPrimaryLanguages": ["python", "go"],
     "commute": { "driveMaxSeconds": 1500, "transitMaxSeconds": 2400 }
-  },
-  "pipeline": ["queryVectorDatabase", "researchCompany", "buildResume"]
+  }
 }

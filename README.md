@@ -1,122 +1,121 @@
-# Composer
+# composer
 
-A standalone **TypeScript Cloudflare Worker** that auto-assembles a tailored job application end to end. It is a migration of the legacy **Conductor** agent (and its `job-*` skills) off the Hyperagent platform and onto the native Cloudflare Developer Platform.
-
-Given a job posting, Composer:
-
-1. queries a **Vectorize** index for supporting technical evidence,
-2. **researches the company** with outbound web `fetch()` calls and screens the role against hard criteria, and
-3. synthesizes a tailored, one-page **resume** with **Workers AI**.
-
-It never fabricates employment claims (the candidate's `source.yml` is the only source of truth), and it never submits an application on its own. Every run stops at a human review gate and returns a result for approval.
+The **intelligence plane**. Does all the work that requires outbound calls, AI inference, or document synthesis. It has no Slack awareness — it receives a job payload, does its work, and POSTs a result back. resumaestro owns the state; composer owns the thinking.
 
 ---
 
-## Migration map: legacy `job-*` concepts → new modules
+## Responsibilities
 
-| Legacy (Hyperagent) | New module | What changed |
-|---|---|---|
-| `job-vector` skill (`job_data.py` calling the job-slack `/data` gateway with a bearer token) | `src/skills/queryVectorDatabase.ts` | Uses the **native** `env.AI.run()` for embeddings and `env.VECTOR_INDEX.query()` for search. No gateway, no bearer token. |
-| `job-research` skill (Python + commute worker + cache lookups) | `src/skills/researchCompany.ts` | Outbound intelligence via standard `fetch()` (Tavily-compatible search + the geoapify commute worker). Hard-criteria screen + fit score preserved. |
-| `job-resume` skill (HTML/PDF via the gateway) | `src/skills/buildResume.ts` | Reads `source.yml` from the **R2** binding and uses **Workers AI** (`env.AI.run()`) to synthesize Markdown. |
-| Conductor orchestration + human gate | `src/agent.ts` | `runPipeline()` runs the three skills in order, honors auto-rejection, and always returns `humanGate: true`. |
-| Agent persona, model settings, system prompt | `config/agentConfig.json`, `config/prompts.ts` | Persona + model settings extracted to JSON; prompt strings exported as constants. |
-| Cloudflare bindings (R2 `job-source`, Vectorize indices, Workers AI) | `wrangler.toml` | Declared as native Worker bindings. |
+- Run each pipeline mode (`surface_scan`, `deep_research`, `tailor`, `refine`, `apply`) as a discrete, self-contained operation
+- Research companies via Vectorize cache first, then Tavily web search — only spending credits on what isn't already known
+- Build per-facet research queries based on the depth and focus areas the user selected
+- Synthesize tailored resumes from the candidate's `source/experience.yml` and company context
+- Fill application forms, identify unknowns, and return them as structured questions
+- Cache all research output back to Vectorize so future runs on the same company are cheaper
 
-> **Architecture note.** The legacy skills routed all Cloudflare I/O through the `job-slack` worker's `/data/*` gateway (holding the R2 / Vectorize / Workers AI bindings behind a token). This migration follows the target's native-binding architecture: the worker holds the bindings directly. The embedding model (`@cf/qwen/qwen3-embedding-0.6b`, 1024-dim cosine) and the hard criteria are unchanged.
+## What it does not own
+
+- Pipeline state — it reads the job record once (from the resumaestro data gateway) and never writes to D1 directly
+- Slack — it has no idea a Slack surface exists; the callback URL it receives is an opaque HTTP endpoint
+- User interaction — if it needs input it can't resolve, it returns `apply_needs_input` and stops; resumaestro handles surfacing the questions
 
 ---
 
-## Project structure
+## Contract with resumaestro
 
-```
-composer/
-├── config/
-│   ├── agentConfig.json          # Extracted persona parameters & model settings
-│   └── prompts.ts                # Exported system-prompt string constants
-├── src/
-│   ├── index.ts                  # Worker entry point (POST handler + async callback)
-│   ├── agent.ts                  # Execution orchestrator coordinating the skills
-│   └── skills/
-│       ├── queryVectorDatabase.ts  # env.AI.run() embed + env.VECTOR_INDEX.query()
-│       ├── researchCompany.ts      # outbound fetch() intelligence + hard-criteria screen
-│       └── buildResume.ts          # env.AI.run() resume synthesis from R2 source of truth
-├── .env.example                  # Local env keys (dummy values)
-├── wrangler.toml                 # R2, Vectorize, and AI bindings + vars
-├── package.json
-├── tsconfig.json                 # Strict TypeScript
-└── README.md
+composer is the **callee**. resumaestro wakes it; composer delivers a result.
+
+### Inbound — the agent payload
+
+resumaestro POSTs to `POST /agent`:
+
+```ts
+{
+  mode: 'surface_scan' | 'deep_research' | 'tailor' | 'refine' | 'apply'
+  job_id: string
+  callback_url: string     // where to deliver the result
+  company?: string
+  listing_url?: string
+  depth?: 'quick' | 'standard' | 'deep'
+  facets?: string[]        // vision | funding | culture | tech_stack | red_flags | manager
+  manager_name?: string
+  concern?: string
+  feedback?: string
+  tone?: string
+  emphasis?: string
+}
 ```
 
+composer acknowledges immediately with `202` and runs the work asynchronously.
+
+### Outbound — the result callback
+
+composer POSTs the result to `callback_url`. The shape is determined by `mode`:
+
+```ts
+// surface_scan — what we learned from the listing
+{ type: 'surface_scan', company, role, comp, work_model, company_url, job_url, scores_json }
+
+// deep_research — company intel brief
+{ type: 'research', summary, signals_json, sources_json, brief_key }
+
+// tailor or refine — synthesized resume
+{ type: 'tailor', resume_pdf_key }
+
+// apply — application submitted or ready
+{ type: 'apply' }
+
+// apply — blocked on missing info
+{ type: 'apply_needs_input', questions: [{ field, question }] }
+
+// any mode — something went wrong
+{ type: 'error', error: string }
+```
+
+composer must always POST to `callback_url`, even on error. resumaestro is waiting.
+
+### Data gateway
+
+composer reads source files and writes research artifacts through resumaestro's bearer-authenticated `/data/*` gateway. It never touches D1 or Vectorize directly — everything goes through the gateway.
+
 ---
 
-## API
+## Research model
 
-### `GET /`
-Service descriptor and health check.
+### Vectorize-first
 
-### `POST /` or `POST /jobs`
-Kicks off the pipeline. JSON body:
+Before making any outbound web requests, `deep_research` queries `RESUMAESTRO_COMPANIES` for a cached brief on the same company. If the score is high enough and the cache is fresh (< 30 days), that brief is used as base context. Tavily is only called for facets not already covered.
 
-| Field | Type | Required | Notes |
-|---|---|---|---|
-| `company` | string | yes | Company name to research. |
-| `query` or `jobDescription` | string | yes (one of) | Drives vector evidence + resume tailoring. |
-| `id` | string | no | Job id; a UUID is generated if omitted. |
-| `address` | string | no | Office address for the commute check. |
-| `workType` | `"remote" \| "hybrid" \| "onsite"` | no | Commute is only checked for hybrid/onsite. |
-| `topK` | number | no | Vector matches to retrieve (default 6). |
-| `callbackUrl` | string | no | If set (or `CALLBACK_BASE_URL` is configured), the worker returns `202` immediately and POSTs the result to `<callbackUrl>/jobs/:id/result`. |
+After every research run, the result is upserted back to Vectorize with metadata (`company`, `facets`, `researchedAt`) so the next research on the same company benefits.
 
-**Async callback flow.** When a callback base is configured, the worker acknowledges with `202 { accepted, jobId }` and later delivers the full `PipelineResult` to `POST /jobs/:id/result`. With no callback configured, it runs synchronously and returns the result inline.
+### Depth × facets
 
-Example:
+`depth` sets the base strategy. Each checked `facet` adds an incremental Tavily query on top.
+
+| depth | base behavior |
+|---|---|
+| `quick` | 1 query, `search_depth: basic` — overview and red flags |
+| `standard` | 2 queries, `search_depth: basic` — overview + culture/stack |
+| `deep` | 1 query per facet, `search_depth: advanced` |
+
+Facet → query mapping:
+- `vision` — roadmaps, priorities, executive trajectory
+- `funding` — investors, financials, business model
+- `culture` — Glassdoor, WFH policy, engineering reviews
+- `tech_stack` — architecture, tools, open source
+- `red_flags` — lawsuits, layoffs, compliance
+- `manager` — interviewer profile; uses `exact_match` if `manager_name` is provided, otherwise searches LinkedIn
+
+All queries run in parallel. Results are deduped by URL.
+
+---
+
+## Deploy
 
 ```bash
-curl -X POST http://localhost:8787/jobs \
-  -H 'content-type: application/json' \
-  -d '{ "company": "Acme", "jobDescription": "Senior frontend engineer, React/TypeScript ...", "workType": "hybrid", "address": "123 Market St, San Francisco" }'
+npx wrangler secret put TAVILY_API_KEY
+npx wrangler secret put ROZZY_KEY
+npx wrangler deploy
 ```
 
----
-
-## Configuration
-
-Resource bindings live in `wrangler.toml`:
-
-- `AI` — Workers AI
-- `VECTOR_INDEX` — Vectorize (defaults to `source-code-rag`; 1024-dim, cosine)
-- `JOB_SOURCE` — R2 bucket `job-source`
-
-Non-secret vars (in `wrangler.toml [vars]`): `EMBEDDING_MODEL`, `RESUME_MODEL`, `COMMUTE_WORKER_URL`, `SEARCH_API_URL`, `CALLBACK_BASE_URL`.
-
-**Secrets** (never committed; see `.env.example` for local dummies):
-
-```bash
-wrangler secret put TAVILY_API_KEY   # web search API key (researchCompany)
-wrangler secret put ROZZY_KEY        # x-rozzy-key header for the commute worker
-```
-
-For local dev, copy `.env.example` to `.dev.vars` and fill in values.
-
----
-
-## Develop & deploy
-
-```bash
-npm install          # install typescript, wrangler, @cloudflare/workers-types
-npm run typecheck    # tsc --noEmit (strict)
-npx wrangler dev     # run locally at http://localhost:8787
-npx wrangler deploy  # deploy to Cloudflare
-```
-
-Before deploying, ensure the R2 bucket (`job-source`) and the Vectorize index (`source-code-rag`) exist in your Cloudflare account and that the bindings in `wrangler.toml` match their names.
-
----
-
-## Guardrails carried over from Conductor
-
-- **Source of truth.** `source.yml` (read from R2) is authoritative. Vector and research results are supporting context only and can never create employment claims.
-- **No fabrication.** Missing data is reported, never invented.
-- **Human gate.** The pipeline never submits. It returns `status: "ready_for_review"` (or `"rejected"` when the role fails the hard criteria) for human approval.
-- **No secrets in the repo.** All credentials are Worker secrets / bindings.
+Set the deployed URL as `AGENT_WEBHOOK_URL` in resumaestro's `wrangler.toml`.

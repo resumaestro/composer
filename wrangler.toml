@@ -1,4 +1,4 @@
-name = "composer"
+name = "resumaestro-composer"
 main = "src/index.ts"
 compatibility_date = "2025-06-01"
 
@@ -6,29 +6,42 @@ compatibility_date = "2025-06-01"
 [ai]
 binding = "AI"
 
-# --- Vectorize (semantic evidence search) ---
-# The single binding the skills use. Defaults to the source-code-rag index (supporting evidence
-# for the resume). All job indices are 1024-dim, cosine. Swap index_name or add more bindings
-# (job-company / job-people / job-role) as your routing needs grow.
+# --- Vectorize ---
+# source-code-rag: candidate experience chunks (read-only, ingested separately)
 [[vectorize]]
 binding = "VECTOR_INDEX"
 index_name = "source-code-rag"
 
-# Additional legacy indices (uncomment + give each a distinct binding to use them):
-# [[vectorize]]
-# binding = "VECTOR_COMPANY"
-# index_name = "job-company"
-# [[vectorize]]
-# binding = "VECTOR_PEOPLE"
-# index_name = "job-people"
-# [[vectorize]]
-# binding = "VECTOR_ROLE"
-# index_name = "job-role"
+# Company research cache (written after researchCompany)
+[[vectorize]]
+binding = "RESUMAESTRO_COMPANIES"
+index_name = "resumaestro-companies"
 
-# --- R2 (source.yml, BASE_RESUME.html, research payloads) ---
+# Interviewer / people research cache (written by future people-research skill)
+[[vectorize]]
+binding = "RESUMAESTRO_TEAMMEMBERS"
+index_name = "resumaestro-teammembers"
+
+# Role / job-description cache (written after buildResume)
+[[vectorize]]
+binding = "RESUMAESTRO_ROLES"
+index_name = "resumaestro-roles"
+
+# --- D1 (queryable pipeline records) ---
+[[d1_databases]]
+binding = "DB"
+database_name = "resumaestro-pipeline"
+database_id = "72bff802-4593-4ed3-9c4f-1923bcb1b406"
+
+# --- R2 (source files + pipeline outputs) ---
 [[r2_buckets]]
-binding = "JOB_SOURCE"
-bucket_name = "job-source"
+binding = "RESUMAESTRO_SOURCE"
+bucket_name = "resumaestro-source"
+
+# --- KV (fast retrieval for briefs and cached answers) ---
+[[kv_namespaces]]
+binding = "RESUMAESTRO_KV"
+id = "PLACEHOLDER_KV_ID"
 
 # --- Non-secret configuration (safe to commit) ---
 [vars]
@@ -37,7 +50,12 @@ RESUME_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
 COMMUTE_WORKER_URL = "https://geoapify-commute-worker.cameronaziz.workers.dev"
 SEARCH_API_URL = "https://api.tavily.com/search"
 CALLBACK_BASE_URL = ""
+RESUMAESTRO_URL = ""
+WORKER_URL = ""
 
 # --- Secrets (DO NOT put values here; set them with `wrangler secret put <NAME>`) ---
 #   wrangler secret put TAVILY_API_KEY   # web search API key used by researchCompany
-#   wrangler secret put ROZZY_KEY        # x-rozzy-key header for the commute worker
+#   wrangler secret put ROZZY_KEY        # bearer token for the resumaestro data gateway
+
+[secrets]
+required = ["TAVILY_API_KEY", "ROZZY_KEY"]
