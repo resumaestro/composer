@@ -2,17 +2,30 @@
   "name": "composer",
   "version": "0.1.0",
   "private": true,
+  "description": "Resumaestro Composer — unified, framework-agnostic Cloudflare Worker that migrates the legacy job-research, job-vector, and job-resume skills into one asynchronous orchestration service.",
   "type": "module",
-  "description": "Standalone TypeScript Cloudflare Worker: migrated job-application agent (vector query, company research, resume synthesis).",
+  "main": "src/index.ts",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit",
-    "build": "tsc --noEmit"
+    "tail": "wrangler tail"
+  },
+  "keywords": [
+    "cloudflare",
+    "workers",
+    "vectorize",
+    "workers-ai",
+    "browser-rendering",
+    "resume"
+  ],
+  "license": "UNLICENSED",
+  "dependencies": {
+    "@cloudflare/puppeteer": "^0.0.14"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20241127.0",
-    "typescript": "^5.6.3",
-    "wrangler": "^3.90.0"
+    "@cloudflare/workers-types": "^4.20240909.0",
+    "typescript": "^5.5.4",
+    "wrangler": "^3.80.0"
   }
 }
