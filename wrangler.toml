@@ -4,7 +4,6 @@ compatibility_date = "2025-06-01"
 
 [observability]
 enabled = true
-invocation_logs = true
 head_sampling_rate = 1
 
 # --- Workers AI (embeddings + resume synthesis) ---
