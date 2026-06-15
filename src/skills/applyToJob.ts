@@ -1,4 +1,5 @@
 import type { Env } from '../index'
+import { selectModel } from '../models'
 import { APPLY_PROMPT } from '../../config/prompts'
 
 export interface ApplyPayload {
@@ -96,7 +97,7 @@ export async function applyToJob(env: Env, payload: ApplyPayload): Promise<Apply
   const userPrompt = contextParts.join('\n')
 
   // 5. Use Workers AI to attempt to answer all form fields.
-  const model = env.RESUME_MODEL || '@cf/meta/llama-3.3-70b-instruct-fp8-fast'
+  const model = await selectModel(env, 'model:apply')
   const run = env.AI.run as unknown as (
     m: string,
     inputs: Record<string, unknown>,

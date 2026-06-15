@@ -24,8 +24,6 @@ export interface Env {
   // --- vars / secrets ---
   /** Embedding model id used for Vectorize queries. */
   EMBEDDING_MODEL?: string;
-  /** Base URL of the resumaestro framework seam for result webhooks. */
-  CALLBACK_BASE_URL?: string;
   /** Optional bearer token for the outbound result webhook. */
   CALLBACK_TOKEN?: string;
   /** Base URL of a Cloudflare AI Gateway. Empty/undefined disables premium tier. */

@@ -32,12 +32,6 @@ export interface Env {
   /** Service binding to the Resumaestro app and integration gateway. */
   RESUMAESTRO: Fetcher;
 
-  // vars (wrangler.toml [vars])
-  EMBEDDING_MODEL?: string;
-  RESUME_MODEL?: string;
-  SEARCH_API_URL?: string;
-  CALLBACK_BASE_URL?: string;
-
   // secrets (wrangler secret put ...)
   TAVILY_KEY?: string;
 }

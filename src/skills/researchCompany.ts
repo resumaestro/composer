@@ -1,4 +1,5 @@
 import type { Env } from "../index";
+import { selectModel } from "../models";
 import agentConfig from "../../config/agentConfig.json";
 import { HARD_CRITERIA_SUMMARY, RESEARCH_GUIDELINES, TONE_DETERMINATION_PROMPT } from "../../config/prompts";
 
@@ -41,8 +42,7 @@ export interface ResearchOptions {
   jobText?: string;
 }
 
-const DEFAULT_SEARCH_API_URL = "https://api.tavily.com/search";
-const DEFAULT_EMBEDDING_MODEL = "@cf/qwen/qwen3-embedding-0.6b";
+const TAVILY_URL = "https://api.tavily.com/search";
 
 interface TavilyResult {
   title?: string;
@@ -105,7 +105,7 @@ async function gatewayVectorUpsert(
 }
 
 async function queryExistingResearch(env: Env, company: string): Promise<string | null> {
-  const model = DEFAULT_EMBEDDING_MODEL;
+  const model = await selectModel(env, 'model:company:query');
   const run = env.AI.run as unknown as (
     m: string,
     inputs: Record<string, unknown>,
@@ -141,7 +141,7 @@ async function determineTone(env: Env, signals: ResearchSignal[], company: strin
     m: string,
     inputs: Record<string, unknown>,
   ) => Promise<ChatResponse>;
-  const model = env.RESUME_MODEL || '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
+  const model = await selectModel(env, 'model:research:deep');
   const signalText = signals.slice(0, 6).map((s) => `${s.title}: ${s.snippet}`).join('\n\n');
   const result = await run(model, {
     messages: [
@@ -271,7 +271,7 @@ async function writeVector(
   facets: string[],
   researchedAt: string,
 ): Promise<void> {
-  const model = DEFAULT_EMBEDDING_MODEL;
+  const model = await selectModel(env, 'model:company:write');
   const run = env.AI.run as unknown as (
     m: string,
     inputs: Record<string, unknown>,
@@ -382,7 +382,7 @@ async function webSearch(env: Env, company: string, options: ResearchOptions): P
       "researchCompany: TAVILY_KEY is not configured. Set it with `wrangler secret put TAVILY_KEY`.",
     );
   }
-  const endpoint = env.SEARCH_API_URL || DEFAULT_SEARCH_API_URL;
+  const endpoint = TAVILY_URL;
   const queries = buildQueries(company, options);
 
   const resultSets = await Promise.all(

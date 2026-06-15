@@ -1,4 +1,5 @@
 import type { Env } from '../index'
+import { selectModel } from '../models'
 import {
   AGENT_PERSONA,
   RESUME_SYSTEM_PROMPT,
@@ -21,8 +22,6 @@ export interface RefineResult {
   type: 'tailor'
   resume_key: string
 }
-
-const DEFAULT_RESUME_MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast'
 
 interface ChatResponse {
   response: string
@@ -214,7 +213,7 @@ export async function refineResume(env: Env, payload: RefinePayload): Promise<Re
   const userPrompt = contextParts.join('\n')
 
   // 6. Synthesize with Workers AI.
-  const model = env.RESUME_MODEL || DEFAULT_RESUME_MODEL
+  const model = await selectModel(env, 'model:resume:refine')
   const run = env.AI.run as unknown as (
     m: string,
     inputs: Record<string, unknown>,

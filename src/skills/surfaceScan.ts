@@ -1,4 +1,5 @@
 import type { Env } from '../index'
+import { selectModel } from '../models'
 import { SURFACE_SCAN_PROMPT } from '../../config/prompts'
 
 interface SurfaceScanPayload {
@@ -61,7 +62,7 @@ export async function surfaceScan(env: Env, payload: SurfaceScanPayload): Promis
     inputs: Record<string, unknown>,
   ) => Promise<ChatResponse>
 
-  const model = env.RESUME_MODEL || '@cf/meta/llama-3.3-70b-instruct-fp8-fast'
+  const model = await selectModel(env, 'model:research:surface')
   const result = await run(model, {
     messages: [
       { role: 'system', content: SURFACE_SCAN_PROMPT },

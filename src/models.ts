@@ -1,22 +1,29 @@
 import type { Env } from './index'
 
-const DEFAULTS = {
-  resume: '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
-  embedding: '@cf/qwen/qwen3-embedding-0.6b',
+const RESUME_DEFAULT = '@cf/meta/llama-3.3-70b-instruct-fp8-fast'
+const EMBEDDING_DEFAULT = '@cf/qwen/qwen3-embedding-0.6b'
+
+export const MODEL_DEFAULTS = {
+  'model:research:surface': RESUME_DEFAULT,
+  'model:apply': RESUME_DEFAULT,
+  'model:research:deep': RESUME_DEFAULT,
+  'model:resume:refine': RESUME_DEFAULT,
+  'model:resume:build': RESUME_DEFAULT,
+  'model:company:query': EMBEDDING_DEFAULT,
+  'model:company:write': EMBEDDING_DEFAULT,
 } as const
 
-export type ModelType = keyof typeof DEFAULTS
+export type ModelKey = keyof typeof MODEL_DEFAULTS
 
-export async function selectModel(env: Env, type: ModelType): Promise<string> {
+export async function selectModel(env: Env, key: ModelKey): Promise<string> {
   try {
-    const kvValue = await env.RESUMAESTRO_CONFIG.get(`model:${type}`)
-    if (kvValue) return kvValue
+    const kvValue = await env.RESUMAESTRO_CONFIG.get(key)
+    if (kvValue) {
+      return kvValue
+    }
   } catch {
-    // KV unavailable — fall through to env/default
+    // KV unavailable — fall through to default
   }
 
-  if (type === 'resume' && env.RESUME_MODEL) return env.RESUME_MODEL
-  if (type === 'embedding' && env.EMBEDDING_MODEL) return env.EMBEDDING_MODEL
-
-  return DEFAULTS[type]
+  return MODEL_DEFAULTS[key]
 }

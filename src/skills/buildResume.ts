@@ -1,4 +1,5 @@
 import type { Env } from "../index";
+import { selectModel } from "../models";
 import { AGENT_PERSONA, RESUME_SYSTEM_PROMPT } from "../../config/prompts";
 
 export interface BuildResumeInput {
@@ -13,8 +14,6 @@ export interface BuildResumeResult {
   type: 'tailor'
   resume_key: string
 }
-
-const DEFAULT_RESUME_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
 
 interface ChatResponse {
   response: string;
@@ -78,7 +77,7 @@ export async function buildResume(env: Env, payload: BuildResumeInput): Promise<
   const r2Key = `resumes/${jobId}/v${version}.md`;
 
   // 4. Assemble the prompt.
-  const model = env.RESUME_MODEL || DEFAULT_RESUME_MODEL;
+  const model = await selectModel(env, 'model:resume:build');
   const userPrompt = [
     `Target company: ${company}`,
     '',
