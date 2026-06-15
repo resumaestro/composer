@@ -1,0 +1,54 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  read-tokens:
+    name: Read tokens.yml
+    runs-on: ubuntu-latest
+    outputs:
+      secret_keys: ${{ steps.read.outputs.secret_keys }}
+      variable_keys: ${{ steps.read.outputs.variable_keys }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: read
+        uses: resumaestro/pit-boss/actions/tokens/read@main
+
+  secrets-sync:
+    name: Sync secrets
+    needs: read-tokens
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: resumaestro/pit-boss/actions/secrets/sync@main
+        with:
+          worker: resumaestro-composer
+          secret_keys: ${{ needs.read-tokens.outputs.secret_keys }}
+          proxy_url: ${{ vars.OBOIST_URL }}
+          proxy_token: ${{ secrets.OBOIST_SECRET }}
+
+  deploy:
+    name: Deploy
+    needs: [read-tokens, secrets-sync]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install
+      - uses: resumaestro/pit-boss/actions/deploy@main
+        with:
+          variable_keys: ${{ needs.read-tokens.outputs.variable_keys }}
+          proxy_url: ${{ vars.OBOIST_URL }}
+          proxy_token: ${{ secrets.OBOIST_SECRET }}
