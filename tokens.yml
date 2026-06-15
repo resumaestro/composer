@@ -1,0 +1,11 @@
+cloudflare:
+  scope:
+    - API Tokens Read
+    - Workers Scripts Write
+  variable:
+    - EMBEDDING_MODEL
+    - RESUME_MODEL
+    - SEARCH_API_URL
+    - CALLBACK_BASE_URL
+  secret:
+    - TAVILY_KEY

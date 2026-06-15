@@ -24,23 +24,22 @@ export interface Env {
   DB: D1Database;
   /** R2 bucket: source files (read) + research/resume outputs (write). */
   RESUMAESTRO_SOURCE: R2Bucket;
-  /** KV namespace for fast retrieval of briefs and cached answers. */
-  RESUMAESTRO_KV: KVNamespace;
+  /** KV namespace for pipeline state: briefs and cached answers. */
+  RESUMAESTRO_PIPELINE: KVNamespace;
+  /** KV namespace for dynamic config: model names, feature flags. */
+  RESUMAESTRO_CONFIG: KVNamespace;
+
+  /** Service binding to the Resumaestro app and integration gateway. */
+  RESUMAESTRO: Fetcher;
 
   // vars (wrangler.toml [vars])
   EMBEDDING_MODEL?: string;
   RESUME_MODEL?: string;
-  COMMUTE_WORKER_URL?: string;
   SEARCH_API_URL?: string;
   CALLBACK_BASE_URL?: string;
-  /** Base URL for the resumaestro data gateway (bearer-authenticated). */
-  RESUMAESTRO_URL?: string;
-  /** Public URL of this worker (used for self-referencing if needed). */
-  WORKER_URL?: string;
 
   // secrets (wrangler secret put ...)
-  TAVILY_API_KEY?: string;
-  ROZZY_KEY?: string;
+  TAVILY_KEY?: string;
 }
 
 type AgentMode = 'surface_scan' | 'deep_research' | 'tailor' | 'refine' | 'apply'

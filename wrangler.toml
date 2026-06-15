@@ -2,6 +2,11 @@ name = "resumaestro-composer"
 main = "src/index.ts"
 compatibility_date = "2025-06-01"
 
+[observability]
+enabled = true
+invocation_logs = true
+head_sampling_rate = 1
+
 # --- Workers AI (embeddings + resume synthesis) ---
 [ai]
 binding = "AI"
@@ -38,24 +43,23 @@ database_id = "72bff802-4593-4ed3-9c4f-1923bcb1b406"
 binding = "RESUMAESTRO_SOURCE"
 bucket_name = "resumaestro-source"
 
-# --- KV (fast retrieval for briefs and cached answers) ---
+# --- KV (pipeline state: briefs and cached answers) ---
 [[kv_namespaces]]
-binding = "RESUMAESTRO_KV"
-id = "PLACEHOLDER_KV_ID"
+binding = "RESUMAESTRO_PIPELINE"
+id = "2deb366330814a7ea7de36072fccaa77"
 
-# --- Non-secret configuration (safe to commit) ---
-[vars]
-EMBEDDING_MODEL = "@cf/qwen/qwen3-embedding-0.6b"
-RESUME_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
-COMMUTE_WORKER_URL = "https://geoapify-commute-worker.cameronaziz.workers.dev"
-SEARCH_API_URL = "https://api.tavily.com/search"
-CALLBACK_BASE_URL = ""
-RESUMAESTRO_URL = ""
-WORKER_URL = ""
+# --- KV (dynamic config: model names, feature flags) ---
+[[kv_namespaces]]
+binding = "RESUMAESTRO_CONFIG"
+id = "0178e5c12f4945f0a230ac7d1f04b4fa"
+
+# --- Service bindings ---
+[[services]]
+binding = "RESUMAESTRO"
+service = "resumaestro-resumaestro"
 
 # --- Secrets (DO NOT put values here; set them with `wrangler secret put <NAME>`) ---
-#   wrangler secret put TAVILY_API_KEY   # web search API key used by researchCompany
-#   wrangler secret put ROZZY_KEY        # bearer token for the resumaestro data gateway
+#   wrangler secret put TAVILY_KEY   # web search API key used by researchCompany
 
 [secrets]
-required = ["TAVILY_API_KEY", "ROZZY_KEY"]
+required = ["TAVILY_KEY"]

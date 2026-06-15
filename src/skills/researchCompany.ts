@@ -42,7 +42,6 @@ export interface ResearchOptions {
 }
 
 const DEFAULT_SEARCH_API_URL = "https://api.tavily.com/search";
-const DEFAULT_COMMUTE_URL = "https://geoapify-commute-worker.cameronaziz.workers.dev";
 const DEFAULT_EMBEDDING_MODEL = "@cf/qwen/qwen3-embedding-0.6b";
 
 interface TavilyResult {
@@ -73,37 +72,23 @@ interface ChatResponse {
 // --- gateway helpers ---
 
 async function gatewayGetR2(env: Env, key: string): Promise<string | null> {
-  const base = (env.RESUMAESTRO_URL ?? '').replace(/\/+$/, '');
-  if (!base) return null;
-  const res = await fetch(`${base}/data/r2?key=${encodeURIComponent(key)}`, {
-    headers: { authorization: `Bearer ${env.ROZZY_KEY ?? ''}` },
-  });
+  const res = await env.RESUMAESTRO.fetch(`https://worker/data/r2?key=${encodeURIComponent(key)}`);
   if (!res.ok) return null;
   return res.text();
 }
 
 async function gatewayPutR2(env: Env, key: string, body: string, contentType: string): Promise<void> {
-  const base = (env.RESUMAESTRO_URL ?? '').replace(/\/+$/, '');
-  if (!base) return;
-  await fetch(`${base}/data/r2?key=${encodeURIComponent(key)}`, {
+  await env.RESUMAESTRO.fetch(`https://worker/data/r2?key=${encodeURIComponent(key)}`, {
     method: 'PUT',
-    headers: {
-      'content-type': contentType,
-      authorization: `Bearer ${env.ROZZY_KEY ?? ''}`,
-    },
+    headers: { 'content-type': contentType },
     body,
   });
 }
 
 async function gatewayPutKV(env: Env, key: string, value: string): Promise<void> {
-  const base = (env.RESUMAESTRO_URL ?? '').replace(/\/+$/, '');
-  if (!base) return;
-  await fetch(`${base}/data/kv/${encodeURIComponent(key)}`, {
+  await env.RESUMAESTRO.fetch(`https://worker/data/kv/${encodeURIComponent(key)}`, {
     method: 'PUT',
-    headers: {
-      'content-type': 'text/plain; charset=utf-8',
-      authorization: `Bearer ${env.ROZZY_KEY ?? ''}`,
-    },
+    headers: { 'content-type': 'text/plain; charset=utf-8' },
     body: value,
   });
 }
@@ -112,14 +97,9 @@ async function gatewayVectorUpsert(
   env: Env,
   vectors: Array<{ id: string; values: number[]; metadata: Record<string, unknown> }>,
 ): Promise<void> {
-  const base = (env.RESUMAESTRO_URL ?? '').replace(/\/+$/, '');
-  if (!base) return;
-  await fetch(`${base}/data/vector/upsert`, {
+  await env.RESUMAESTRO.fetch('https://worker/data/vector/upsert', {
     method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      authorization: `Bearer ${env.ROZZY_KEY ?? ''}`,
-    },
+    headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ vectors }),
   });
 }
@@ -397,16 +377,16 @@ async function runTavilyQuery(
 }
 
 async function webSearch(env: Env, company: string, options: ResearchOptions): Promise<ResearchSignal[]> {
-  if (!env.TAVILY_API_KEY) {
+  if (!env.TAVILY_KEY) {
     throw new Error(
-      "researchCompany: TAVILY_API_KEY is not configured. Set it with `wrangler secret put TAVILY_API_KEY`.",
+      "researchCompany: TAVILY_KEY is not configured. Set it with `wrangler secret put TAVILY_KEY`.",
     );
   }
   const endpoint = env.SEARCH_API_URL || DEFAULT_SEARCH_API_URL;
   const queries = buildQueries(company, options);
 
   const resultSets = await Promise.all(
-    queries.map((query) => runTavilyQuery(endpoint, env.TAVILY_API_KEY!, query)),
+    queries.map((query) => runTavilyQuery(endpoint, env.TAVILY_KEY!, query)),
   );
 
   // Flatten and dedupe by URL (keep first occurrence).
@@ -426,22 +406,21 @@ async function webSearch(env: Env, company: string, options: ResearchOptions): P
 // --- commute check ---
 
 async function commuteCheck(env: Env, address: string): Promise<CommuteResult> {
-  if (!env.ROZZY_KEY) {
-    throw new Error(
-      "researchCompany: ROZZY_KEY is not configured. Set it with `wrangler secret put ROZZY_KEY`.",
-    );
-  }
   const driveMax = agentConfig.hardCriteria.commute.driveMaxSeconds;
   const transitMax = agentConfig.hardCriteria.commute.transitMaxSeconds;
-  const base = (env.COMMUTE_WORKER_URL || DEFAULT_COMMUTE_URL).replace(/\/+$/, "");
 
-  const response = await fetch(`${base}/route/address`, {
-    method: "POST",
-    headers: { "content-type": "application/json", "x-rozzy-key": env.ROZZY_KEY },
-    body: JSON.stringify({ address }),
-  });
+  const response = await env.RESUMAESTRO.fetch(
+    "https://worker/commute/route/address",
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ address }),
+    },
+  );
   if (!response.ok) {
-    throw new Error(`researchCompany: commute worker returned ${response.status}.`);
+    throw new Error(
+      `researchCompany: resumaestro commute route returned ${response.status}.`,
+    );
   }
   const data = (await response.json()) as {
     routes?: { drive?: { durationSeconds?: number }; transit?: { durationSeconds?: number } };

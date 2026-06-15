@@ -34,21 +34,13 @@ interface ApplyExtraction {
 // --- gateway helpers ---
 
 async function gatewayGetR2(env: Env, key: string): Promise<string | null> {
-  const base = (env.RESUMAESTRO_URL ?? '').replace(/\/+$/, '')
-  if (!base) return null
-  const res = await fetch(`${base}/data/r2?key=${encodeURIComponent(key)}`, {
-    headers: { authorization: `Bearer ${env.ROZZY_KEY ?? ''}` },
-  })
+  const res = await env.RESUMAESTRO.fetch(`https://worker/data/r2?key=${encodeURIComponent(key)}`)
   if (!res.ok) return null
   return res.text()
 }
 
 async function gatewayGetJob(env: Env, jobId: string): Promise<Record<string, unknown> | null> {
-  const base = (env.RESUMAESTRO_URL ?? '').replace(/\/+$/, '')
-  if (!base) return null
-  const res = await fetch(`${base}/data/d1/jobs/${encodeURIComponent(jobId)}`, {
-    headers: { authorization: `Bearer ${env.ROZZY_KEY ?? ''}` },
-  })
+  const res = await env.RESUMAESTRO.fetch(`https://worker/data/d1/jobs/${encodeURIComponent(jobId)}`)
   if (!res.ok) return null
   return res.json() as Promise<Record<string, unknown>>
 }

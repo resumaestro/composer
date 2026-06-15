@@ -119,14 +119,9 @@ export async function surfaceScan(env: Env, payload: SurfaceScanPayload): Promis
 // --- gateway helpers ---
 
 async function gatewayPutR2(env: Env, key: string, body: string, contentType: string): Promise<void> {
-  const base = (env.RESUMAESTRO_URL ?? '').replace(/\/+$/, '')
-  if (!base) return // no gateway configured — skip silently
-  await fetch(`${base}/data/r2?key=${encodeURIComponent(key)}`, {
+  await env.RESUMAESTRO.fetch(`https://worker/data/r2?key=${encodeURIComponent(key)}`, {
     method: 'PUT',
-    headers: {
-      'content-type': contentType,
-      authorization: `Bearer ${env.ROZZY_KEY ?? ''}`,
-    },
+    headers: { 'content-type': contentType },
     body,
   })
 }

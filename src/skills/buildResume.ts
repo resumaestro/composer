@@ -23,44 +23,27 @@ interface ChatResponse {
 // --- gateway helpers ---
 
 async function gatewayGetR2(env: Env, key: string): Promise<string | null> {
-  const base = (env.RESUMAESTRO_URL ?? '').replace(/\/+$/, '');
-  if (!base) return null;
-  const res = await fetch(`${base}/data/r2?key=${encodeURIComponent(key)}`, {
-    headers: { authorization: `Bearer ${env.ROZZY_KEY ?? ''}` },
-  });
+  const res = await env.RESUMAESTRO.fetch(`https://worker/data/r2?key=${encodeURIComponent(key)}`);
   if (!res.ok) return null;
   return res.text();
 }
 
 async function gatewayPutR2(env: Env, key: string, body: string, contentType: string): Promise<void> {
-  const base = (env.RESUMAESTRO_URL ?? '').replace(/\/+$/, '');
-  if (!base) return;
-  await fetch(`${base}/data/r2?key=${encodeURIComponent(key)}`, {
+  await env.RESUMAESTRO.fetch(`https://worker/data/r2?key=${encodeURIComponent(key)}`, {
     method: 'PUT',
-    headers: {
-      'content-type': contentType,
-      authorization: `Bearer ${env.ROZZY_KEY ?? ''}`,
-    },
+    headers: { 'content-type': contentType },
     body,
   });
 }
 
 async function gatewayGetKV(env: Env, key: string): Promise<string | null> {
-  const base = (env.RESUMAESTRO_URL ?? '').replace(/\/+$/, '');
-  if (!base) return null;
-  const res = await fetch(`${base}/data/kv/${encodeURIComponent(key)}`, {
-    headers: { authorization: `Bearer ${env.ROZZY_KEY ?? ''}` },
-  });
+  const res = await env.RESUMAESTRO.fetch(`https://worker/data/kv/${encodeURIComponent(key)}`);
   if (!res.ok) return null;
   return res.text();
 }
 
 async function gatewayGetJob(env: Env, jobId: string): Promise<Record<string, unknown> | null> {
-  const base = (env.RESUMAESTRO_URL ?? '').replace(/\/+$/, '');
-  if (!base) return null;
-  const res = await fetch(`${base}/data/d1/jobs/${encodeURIComponent(jobId)}`, {
-    headers: { authorization: `Bearer ${env.ROZZY_KEY ?? ''}` },
-  });
+  const res = await env.RESUMAESTRO.fetch(`https://worker/data/d1/jobs/${encodeURIComponent(jobId)}`);
   if (!res.ok) return null;
   return res.json() as Promise<Record<string, unknown>>;
 }
