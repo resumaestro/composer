@@ -24,8 +24,6 @@ export interface Env {
   // --- vars / secrets ---
   /** Embedding model id used for Vectorize queries. */
   EMBEDDING_MODEL?: string;
-  /** Optional bearer token for the outbound result webhook. */
-  CALLBACK_TOKEN?: string;
   /** Base URL of a Cloudflare AI Gateway. Empty/undefined disables premium tier. */
   AI_GATEWAY_URL?: string;
   /** API key for the premium provider (Anthropic by default). */

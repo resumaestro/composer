@@ -41,7 +41,6 @@ type AgentMode = 'surface_scan' | 'deep_research' | 'tailor' | 'refine' | 'apply
 type AgentPayload = {
   mode: AgentMode
   job_id: string
-  callback_url: string
   listing_url?: string
   depth?: 'quick' | 'standard' | 'deep'
   facets?: string[]
@@ -63,10 +62,10 @@ function json(body: unknown, status = 200): Response {
 async function dispatchMode(env: Env, payload: AgentPayload): Promise<void> {
   try {
     const result = await runMode(env, payload)
-    await postCallback(payload.callback_url, payload.job_id, payload.mode, result)
+    await postCallback(env, payload.job_id, payload.mode, result)
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
-    await postCallback(payload.callback_url, payload.job_id, payload.mode, {
+    await postCallback(env, payload.job_id, payload.mode, {
       job_id: payload.job_id,
       type: 'error',
       error: message,
@@ -91,25 +90,21 @@ async function runMode(env: Env, payload: AgentPayload): Promise<Record<string, 
   }
 }
 
-/** POST the pipeline result back to the platform's async callback endpoint.
- *  On failure, attempts a recovery POST to /error so resumaestro can clear in_flight.
- */
 async function postCallback(
-  callbackUrl: string,
+  env: Env,
   jobId: string,
   mode: string,
   payload: unknown,
 ): Promise<void> {
   try {
-    await fetch(callbackUrl, {
+    await env.RESUMAESTRO.fetch(`https://worker/jobs/${jobId}/result`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(payload),
     })
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e)
-    const errorUrl = callbackUrl.replace('/result', '/error')
-    await fetch(errorUrl, {
+    await env.RESUMAESTRO.fetch(`https://worker/jobs/${jobId}/error`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ mode, error: message, errorType: 'transient' }),
@@ -169,8 +164,8 @@ export default {
       } catch {
         return json({ error: 'Invalid JSON body.' }, 400)
       }
-      if (!body.mode || !body.job_id || !body.callback_url) {
-        return json({ error: 'mode, job_id, and callback_url are required.' }, 400)
+      if (!body.mode || !body.job_id) {
+        return json({ error: 'mode and job_id are required.' }, 400)
       }
       ctx.waitUntil(dispatchMode(env, body))
       return json({ accepted: true, jobId: body.job_id }, 202)
