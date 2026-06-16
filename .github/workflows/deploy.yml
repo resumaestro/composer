@@ -52,5 +52,5 @@ jobs:
           variable_keys: ${{ needs.read-tokens.outputs.variable_keys }}
           proxy_url: ${{ vars.OBOIST_URL }}
           proxy_token: ${{ secrets.OBOIST_SECRET }}
-          cloudflare_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          cloudflare_token: ${{ secrets.CLOUDFLARE_TOKEN }}
           cloudflare_account_id: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
